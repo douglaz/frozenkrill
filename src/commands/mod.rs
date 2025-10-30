@@ -12,6 +12,7 @@ use frozenkrill_core::{
 use frozenkrill_core::secrecy::SecretString;
 
 pub(crate) mod batch_generate_export;
+pub(crate) mod combine_secret;
 pub(crate) mod common;
 pub(crate) mod export_public_info;
 pub(crate) mod generate;
@@ -20,6 +21,7 @@ pub(crate) mod psbt;
 pub(crate) mod reencode;
 pub(crate) mod show_receiving_qr_code;
 pub(crate) mod show_secrets;
+pub(crate) mod split_secret;
 
 pub(crate) fn benchmark() -> anyhow::Result<()> {
     let password = SecretString::new("top secret".into());

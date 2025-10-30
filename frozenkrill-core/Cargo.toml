@@ -8,12 +8,15 @@ license = "MIT OR Apache-2.0"
 alkali = "0.3"
 libsodium-sys-stable = "1.22.3"
 anyhow = { version = "1", features = ["backtrace"] }
+base64 = "0.22"
 bip39 = { git = "https://github.com/rust-bitcoin/rust-bip39", features = [
     "rand",
     "zeroize",
 ] }
 bitcoin = "0.32"
 blake3 = { version = "1", features = ["rayon"] }
+chrono = "0.4"
+curve25519-dalek = { version = "4", features = ["serde"] }
 env_logger = "0.11"
 flate2 = "1"
 hex = "0.4"
@@ -31,6 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+vsss-rs = { version = "4", features = ["curve25519"] }
 walkdir = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 

@@ -36,6 +36,7 @@ pub mod key_derivation;
 pub mod mnemonic_utils;
 pub mod psbt;
 pub mod random_generation_utils;
+pub mod secret_sharing;
 pub mod slip132;
 pub mod utils;
 pub mod wallet_description;

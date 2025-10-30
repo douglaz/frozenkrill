@@ -503,6 +503,52 @@ struct BenchmarkArgs;
 #[command(about = "Shows the version")]
 struct VersionArgs;
 
+#[derive(clap::Args)]
+#[command(about = "Split a wallet seed into shares using Pedersen secret sharing")]
+struct SplitSecretArgs {
+    #[clap(flatten)]
+    common: CommonOpenArgs,
+    #[clap(
+        long,
+        action,
+        help = ENABLE_DURESS_WALLET
+    )]
+    enable_duress_wallet: bool,
+    #[clap(
+        long,
+        help = "Minimum number of shares needed to reconstruct the secret (M in M-of-N)",
+        default_value = "3"
+    )]
+    threshold: u8,
+    #[clap(
+        long,
+        help = "Total number of shares to create (N in M-of-N)",
+        default_value = "5"
+    )]
+    total_shares: u8,
+    #[clap(
+        long,
+        help = "Directory where share files will be written",
+        default_value = "."
+    )]
+    output_dir: String,
+}
+
+#[derive(clap::Args)]
+#[command(about = "Combine shares to reconstruct a wallet seed")]
+struct CombineSecretArgs {
+    #[clap(
+        help = "Paths to share files or directories containing share files"
+    )]
+    share_paths: Vec<String>,
+    #[clap(
+        long,
+        action,
+        help = "Display the reconstructed mnemonic phrase (WARNING: will show secret on screen)"
+    )]
+    display_mnemonic: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Interactive(InteractiveArgs),
@@ -511,6 +557,8 @@ enum Commands {
     SinglesigOpen(SinglesigOpenArgs),
     MultisigOpen(MultisigOpenArgs),
     SinglesigBatchGenerateExport(SinglesigBatchGenerateExportArgs),
+    SplitSecret(SplitSecretArgs),
+    CombineSecret(CombineSecretArgs),
     Benchmark(BenchmarkArgs),
     Version(VersionArgs),
 }
@@ -812,6 +860,45 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 ic,
                 &args,
             )?
+        }
+        Commands::SplitSecret(args) => {
+            // Open the wallet
+            let open_args = SinglesigOpenArgs {
+                common: args.common.clone(),
+                enable_duress_wallet: args.enable_duress_wallet,
+                command: SinglesigOpenCommands::ShowSecrets(SinglesigShowSecretsArgs {
+                    acknowledge_dangerous_operation: true, // Internal call, we know what we're doing
+                }),
+            };
+
+            let (wallet, _non_duress_password) = open_singlesig_wallet_non_interactive(
+                theme.as_ref(),
+                term,
+                &secp,
+                ic,
+                &open_args,
+            )?;
+
+            // Split the wallet
+            let output_dir = std::path::PathBuf::from(&args.output_dir);
+            commands::split_secret::split_singlesig_wallet(
+                theme.as_ref(),
+                term,
+                &secp,
+                &wallet,
+                args.threshold,
+                args.total_shares,
+                &output_dir,
+                &mut rng,
+            )?;
+        }
+        Commands::CombineSecret(args) => {
+            commands::combine_secret::combine_shares(
+                theme.as_ref(),
+                term,
+                &args.share_paths,
+                args.display_mnemonic,
+            )?;
         }
         Commands::Interactive(args) => commands::interactive::interactive(
             theme.as_ref(),
