@@ -16,7 +16,7 @@ use std::{
 };
 
 use frozenkrill_core::{
-    DEFAULT_MAX_ADDITIONAL_PADDING, DEFAULT_MIN_ADDITIONAL_PADDING,
+    DEFAULT_MAX_ADDITIONAL_PADDING, DEFAULT_MIN_ADDITIONAL_PADDING, PaddingParams,
     anyhow::{self, Context, bail},
     bip39::{self, Language, Mnemonic},
     bitcoin::{
@@ -25,7 +25,7 @@ use frozenkrill_core::{
     },
     custom_logger,
     key_derivation::{self, KeyDerivationDifficulty, default_derive_key},
-    log, mnemonic_utils, rand,
+    log, mnemonic_utils, parse_keyfiles_paths, rand,
     rand_core::CryptoRng,
     random_generation_utils::get_secp,
     wallet_description::{EncryptedWalletVersion, KEY_SIZE, MultisigType, SALT_SIZE, ScriptType},
@@ -377,7 +377,7 @@ enum MultisigOpenCommands {
     Reencode(MultisigReencodeArgs),
 }
 
-#[derive(clap::Args)]
+#[derive(Clone, clap::Args)]
 struct CommonOpenArgs {
     #[clap(
         long,
@@ -532,14 +532,34 @@ struct SplitSecretArgs {
         default_value = "."
     )]
     output_dir: String,
+    #[clap(
+        long,
+        action,
+        help = "Disable all padding for share files. WARNING: File size may leak information about wallet contents"
+    )]
+    disable_all_padding: bool,
+    #[clap(
+        long,
+        default_value_t = DEFAULT_MIN_ADDITIONAL_PADDING
+    )]
+    min_additional_padding_bytes: u32,
+    #[clap(
+        long,
+        default_value_t = DEFAULT_MAX_ADDITIONAL_PADDING
+    )]
+    max_additional_padding_bytes: u32,
+    #[clap(
+        long,
+        help = WALLET_FILE_TYPE_HELP,
+        default_value_t = WalletFileType::Standard
+    )]
+    wallet_file_type: WalletFileType,
 }
 
 #[derive(clap::Args)]
 #[command(about = "Combine shares to reconstruct a wallet seed")]
 struct CombineSecretArgs {
-    #[clap(
-        help = "Paths to share files or directories containing share files"
-    )]
+    #[clap(help = "Paths to share files or directories containing share files")]
     share_paths: Vec<String>,
     #[clap(
         long,
@@ -635,7 +655,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::Error> {
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
     let mut secp = get_secp(&mut rng);
     let ic = InternetCheckerImpl::new(cli.disable_internet_check);
     match cli.command {
@@ -862,22 +882,42 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             )?
         }
         Commands::SplitSecret(args) => {
-            // Open the wallet
+            // Parse keyfiles and get password before opening wallet
+            // We need the password for both opening and encrypting shares
+            let keyfiles = parse_keyfiles_paths(&args.common.keyfile)?;
+            let password = match args.common.password.clone() {
+                Some(p) => Arc::new(SecretString::new(p.into())),
+                None => ask_password(theme.as_ref(), term).map(Arc::new)?,
+            };
+
+            // Open the wallet using the same password
             let open_args = SinglesigOpenArgs {
-                common: args.common.clone(),
+                common: CommonOpenArgs {
+                    keyfile: args.common.keyfile.clone(),
+                    difficulty: args.common.difficulty,
+                    wallet_input_file: args.common.wallet_input_file.clone(),
+                    password: Some(password.expose_secret().to_string()),
+                },
                 enable_duress_wallet: args.enable_duress_wallet,
                 command: SinglesigOpenCommands::ShowSecrets(SinglesigShowSecretsArgs {
                     acknowledge_dangerous_operation: true, // Internal call, we know what we're doing
                 }),
             };
 
-            let (wallet, _non_duress_password) = open_singlesig_wallet_non_interactive(
-                theme.as_ref(),
-                term,
-                &secp,
-                ic,
-                &open_args,
+            let (wallet, _non_duress_password) =
+                open_singlesig_wallet_non_interactive(theme.as_ref(), term, &secp, ic, &open_args)?;
+
+            // Create padding params
+            let padding_params = PaddingParams::new(
+                args.disable_all_padding,
+                Some(args.min_additional_padding_bytes),
+                Some(args.max_additional_padding_bytes),
             )?;
+
+            // Determine encrypted version
+            let encrypted_version = args
+                .wallet_file_type
+                .to_encrypted_wallet_version(wallet.network, wallet.script_type)?;
 
             // Split the wallet
             let output_dir = std::path::PathBuf::from(&args.output_dir);
@@ -889,6 +929,11 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 args.threshold,
                 args.total_shares,
                 &output_dir,
+                &password,
+                &keyfiles,
+                args.common.difficulty,
+                &padding_params,
+                encrypted_version,
                 &mut rng,
             )?;
         }
@@ -1095,7 +1140,7 @@ fn handle_output_path<S: AsRef<std::ffi::OsStr> + ?Sized>(
 }
 
 fn ui_ask_manually_seed_input(
-    rng: &mut impl CryptoRng,
+    rng: &mut (impl CryptoRng + frozenkrill_core::rand::RngCore),
     theme: &dyn Theme,
     term: &Term,
     word_count: &WordCount,

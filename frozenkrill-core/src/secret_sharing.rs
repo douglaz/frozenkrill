@@ -1,18 +1,37 @@
-//! Secret sharing implementation using Pedersen Verifiable Secret Sharing.
+//! Secret sharing implementation using Pedersen Verifiable Secret Sharing (VSS).
+//!
+//! This module implements **Pedersen VSS**, which is **Shamir's Secret Sharing with added
+//! verifiability**. While Shamir's scheme splits secrets into shares with threshold reconstruction,
+//! Pedersen VSS adds cryptographic commitments that allow anyone to verify shares are valid
+//! without learning anything about the secret.
+//!
+//! ## What is Pedersen VSS?
+//!
+//! Pedersen VSS = **Shamir's Secret Sharing** + **Pedersen Commitments** for verification
+//!
+//! - **Base scheme**: Shamir's polynomial secret sharing (M-of-N threshold)
+//! - **Enhancement**: Pedersen commitments provide verifiability
+//! - **Benefit**: Shares can be verified as authentic before they're needed
+//!
+//! ## Why VSS instead of plain Shamir?
+//!
+//! Traditional Shamir's Secret Sharing has a problem: you can't verify shares are valid until
+//! you try to reconstruct the secret. With Pedersen VSS, share holders can verify their shares
+//! are genuine at any time, which is crucial for inheritance/backup scenarios where shares
+//! may not be used for years.
 //!
 //! This module provides functionality to split BIP-39 mnemonic phrases into shares
-//! and reconstruct them using the Pedersen scheme, which allows verification of
-//! shares without revealing information about the secret.
+//! and reconstruct them using the Pedersen VSS scheme.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bip39::Mnemonic;
 use curve25519_dalek::scalar::Scalar;
-use secrecy::{SecretBox};
+use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use vsss_rs::curve25519::{WrappedRistretto, WrappedScalar};
-use vsss_rs::pedersen::{split_secret, StdPedersenResult};
-use vsss_rs::{combine_shares, PedersenResult};
+use vsss_rs::pedersen::{StdPedersenResult, split_secret};
+use vsss_rs::{PedersenResult, combine_shares};
 use zeroize::Zeroize;
 
 /// Error types for secret sharing operations
@@ -95,8 +114,7 @@ impl Share {
 
     /// Save this share to a file
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize share")?;
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize share")?;
 
         let warning = format!(
             "// WARNING: This is share {}/{} of a split secret.\n\
@@ -107,29 +125,28 @@ impl Share {
         );
 
         let content = warning + &json;
-        std::fs::write(path, content)
-            .context("Failed to write share file")?;
+        std::fs::write(path, content).context("Failed to write share file")?;
 
         Ok(())
     }
 
     /// Load a share from a file
     pub fn load_from_file(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .context("Failed to read share file")?;
+        let content = std::fs::read_to_string(path).context("Failed to read share file")?;
 
         // Skip warning comments at the beginning
-        let json_start = content.find('{')
-            .ok_or_else(|| anyhow!(SecretSharingError::FileFormatError(
+        let json_start = content.find('{').ok_or_else(|| {
+            anyhow!(SecretSharingError::FileFormatError(
                 "No JSON object found in file".to_string()
-            )))?;
+            ))
+        })?;
 
         let json = &content[json_start..];
-        let share: Share = serde_json::from_str(json)
-            .context("Failed to parse share file")?;
+        let share: Share = serde_json::from_str(json).context("Failed to parse share file")?;
 
         // Verify checksum immediately after loading
-        share.verify_checksum()
+        share
+            .verify_checksum()
             .context("Share checksum verification failed")?;
 
         Ok(share)
@@ -154,16 +171,21 @@ fn scalar_to_mnemonic(scalar: WrappedScalar, word_count: usize) -> Result<Secret
     let mut entropy = scalar.0.to_bytes().to_vec();
 
     // Trim to expected length based on word count
-    let expected_len = if word_count == 12 { 16 } else if word_count == 24 { 32 } else {
+    let expected_len = if word_count == 12 {
+        16
+    } else if word_count == 24 {
+        32
+    } else {
         bail!(SecretSharingError::InvalidMnemonicLength);
     };
 
     entropy.truncate(expected_len);
 
     // Create mnemonic from entropy
-    let mnemonic = Mnemonic::from_entropy(&entropy)
-        .map_err(|e| anyhow!(SecretSharingError::InvalidReconstructedChecksum)
-            .context(format!("Failed to create mnemonic: {}", e)))?;
+    let mnemonic = Mnemonic::from_entropy(&entropy).map_err(|e| {
+        anyhow!(SecretSharingError::InvalidReconstructedChecksum)
+            .context(format!("Failed to create mnemonic: {}", e))
+    })?;
 
     // Zeroize entropy before dropping
     entropy.zeroize();
@@ -171,22 +193,28 @@ fn scalar_to_mnemonic(scalar: WrappedScalar, word_count: usize) -> Result<Secret
     Ok(SecretBox::new(Box::new(mnemonic)))
 }
 
-/// Split a BIP-39 mnemonic into shares using Pedersen Verifiable Secret Sharing
+/// Split a BIP-39 mnemonic into shares using Pedersen VSS (enhanced Shamir's Secret Sharing)
+///
+/// This uses **Shamir's polynomial secret sharing** as the base algorithm, enhanced with
+/// **Pedersen commitments** for verifiability. The core splitting/reconstruction follows
+/// Shamir's 1979 scheme, but adds the ability to verify shares without revealing the secret.
 ///
 /// # Arguments
 /// * `mnemonic` - The mnemonic phrase to split
-/// * `threshold` - Minimum number of shares needed to reconstruct (M in M-of-N)
-/// * `total_shares` - Total number of shares to create (N in M-of-N)
+/// * `threshold` - Minimum number of shares needed to reconstruct (M in M-of-N, from Shamir)
+/// * `total_shares` - Total number of shares to create (N in M-of-N, from Shamir)
 /// * `rng` - A cryptographically secure random number generator
 ///
 /// # Returns
 /// A vector of `Share` structs containing the split secret and verification data
 ///
 /// # Security Notes
-/// - Uses Pedersen commitments for verifiable secret sharing
+/// - Uses Shamir's polynomial interpolation for threshold reconstruction
+/// - Adds Pedersen commitments for verifiable secret sharing
 /// - All intermediate values are zeroized after use
 /// - Shares can be verified without revealing information about the secret
-pub fn split_mnemonic<R: rand_core::RngCore + rand_core::CryptoRng>(
+/// - Information-theoretic security: M-1 shares reveal nothing (from Shamir's scheme)
+pub fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     mnemonic: &Mnemonic,
     threshold: u8,
     total_shares: u8,
@@ -221,7 +249,8 @@ pub fn split_mnemonic<R: rand_core::RngCore + rand_core::CryptoRng>(
         None, // share_generator - use default
         None, // blind_factor_generator - use random
         rng,
-    ).map_err(|e| anyhow!("Failed to split secret: {:?}", e))?;
+    )
+    .map_err(|e| anyhow!("Failed to split secret: {:?}", e))?;
 
     // Extract shares and verifiers from result
     let secret_shares = result.secret_shares();
@@ -282,24 +311,28 @@ pub fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<Mnemonic
     let first = &shares[0];
     for share in shares.iter().skip(1) {
         if share.version != first.version {
-            bail!(SecretSharingError::IncompatibleShares(
-                format!("Version mismatch: {} vs {}", share.version, first.version)
-            ));
+            bail!(SecretSharingError::IncompatibleShares(format!(
+                "Version mismatch: {} vs {}",
+                share.version, first.version
+            )));
         }
         if share.threshold != first.threshold {
-            bail!(SecretSharingError::IncompatibleShares(
-                format!("Threshold mismatch: {} vs {}", share.threshold, first.threshold)
-            ));
+            bail!(SecretSharingError::IncompatibleShares(format!(
+                "Threshold mismatch: {} vs {}",
+                share.threshold, first.threshold
+            )));
         }
         if share.total_shares != first.total_shares {
-            bail!(SecretSharingError::IncompatibleShares(
-                format!("Total shares mismatch: {} vs {}", share.total_shares, first.total_shares)
-            ));
+            bail!(SecretSharingError::IncompatibleShares(format!(
+                "Total shares mismatch: {} vs {}",
+                share.total_shares, first.total_shares
+            )));
         }
         if share.mnemonic_length != first.mnemonic_length {
-            bail!(SecretSharingError::IncompatibleShares(
-                format!("Mnemonic length mismatch: {} vs {}", share.mnemonic_length, first.mnemonic_length)
-            ));
+            bail!(SecretSharingError::IncompatibleShares(format!(
+                "Mnemonic length mismatch: {} vs {}",
+                share.mnemonic_length, first.mnemonic_length
+            )));
         }
         if share.verification_data != first.verification_data {
             bail!(SecretSharingError::IncompatibleShares(
@@ -319,19 +352,124 @@ pub fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<Mnemonic
     // Decode share data
     let mut share_bytes: Vec<Vec<u8>> = Vec::new();
     for share in shares {
-        let bytes = hex::decode(&share.share_data)
-            .context("Failed to decode share data")?;
+        let bytes = hex::decode(&share.share_data).context("Failed to decode share data")?;
         share_bytes.push(bytes);
     }
 
     // Combine shares to reconstruct the scalar
-    let reconstructed: WrappedScalar = combine_shares(&share_bytes)
-        .map_err(|e| anyhow!("Failed to combine shares: {:?}", e))?;
+    let reconstructed: WrappedScalar =
+        combine_shares(&share_bytes).map_err(|e| anyhow!("Failed to combine shares: {:?}", e))?;
 
     // Convert scalar back to mnemonic
     let mnemonic = scalar_to_mnemonic(reconstructed, first.mnemonic_length)?;
 
     Ok(mnemonic)
+}
+
+/// Split a singlesig wallet into VSS shares
+///
+/// # Arguments
+/// * `wallet` - The singlesig wallet to split
+/// * `threshold` - Minimum number of shares needed to reconstruct (M in M-of-N)
+/// * `total_shares` - Total number of shares to create (N in M-of-N)
+/// * `rng` - A cryptographically secure random number generator
+///
+/// # Returns
+/// A vector of `VssJsonWalletDescriptionV0` structs, each containing a share and the wallet metadata
+pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
+    wallet: &crate::wallet_description::SinglesigJsonWalletDescriptionV0,
+    threshold: u8,
+    total_shares: u8,
+    rng: &mut R,
+) -> Result<Vec<crate::wallet_description::VssJsonWalletDescriptionV0>> {
+    // Parse the mnemonic from the wallet
+    let mnemonic =
+        Mnemonic::parse(&wallet.seed_phrase).context("Failed to parse mnemonic from wallet")?;
+
+    // Split the mnemonic into shares
+    let shares = split_mnemonic(&mnemonic, threshold, total_shares, rng)?;
+
+    // Convert each share to a VssJsonWalletDescriptionV0
+    let mut vss_wallets = Vec::new();
+    for share in shares {
+        let vss_wallet = crate::wallet_description::VssJsonWalletDescriptionV0::from_singlesig(
+            wallet.clone(),
+            share.share_index,
+            share.threshold,
+            share.total_shares,
+            share.share_data,
+            share.verification_data,
+        );
+        vss_wallets.push(vss_wallet);
+    }
+
+    Ok(vss_wallets)
+}
+
+/// Combine VSS wallet shares to reconstruct the original wallet
+///
+/// # Arguments
+/// * `vss_wallets` - A slice of `VssJsonWalletDescriptionV0` (must have at least threshold shares)
+///
+/// # Returns
+/// The reconstructed mnemonic as a string
+///
+/// # Security Notes
+/// - Verifies all shares using Pedersen commitments before reconstruction
+/// - Validates the reconstructed mnemonic has a valid BIP-39 checksum
+/// - All intermediate values are zeroized after use
+pub fn combine_vss_wallets(
+    vss_wallets: &[crate::wallet_description::VssJsonWalletDescriptionV0],
+) -> Result<String> {
+    if vss_wallets.is_empty() {
+        bail!(anyhow!("No VSS wallets provided"));
+    }
+
+    // Verify all wallets are singlesig
+    for wallet in vss_wallets {
+        if !wallet.is_singlesig() {
+            bail!(anyhow!(
+                "Only singlesig VSS wallets are currently supported"
+            ));
+        }
+    }
+
+    // Extract the mnemonic length from the first wallet
+    let mnemonic_length = if let crate::wallet_description::OriginalWalletJson::Singlesig(ref w) =
+        vss_wallets[0].original_wallet
+    {
+        // Parse the seed phrase to get word count
+        let mnemonic = Mnemonic::parse(&w.seed_phrase)
+            .context("Failed to parse mnemonic from first wallet")?;
+        mnemonic.word_count()
+    } else {
+        bail!(anyhow!("Expected singlesig wallet"));
+    };
+
+    // Extract shares from the VSS wallets
+    let mut shares = Vec::new();
+    for wallet in vss_wallets {
+        let share = Share {
+            version: wallet.version,
+            scheme: "pedersen".to_string(),
+            share_index: wallet.share_index,
+            threshold: wallet.threshold,
+            total_shares: wallet.total_shares,
+            mnemonic_length,
+            share_data: wallet.share_data.clone(),
+            verification_data: wallet.verification_data.clone(),
+            created_at: wallet.created_at.clone(),
+            checksum: blake3::hash(wallet.share_data.as_bytes())
+                .to_hex()
+                .to_string(),
+        };
+        shares.push(share);
+    }
+
+    // Combine the shares to reconstruct the mnemonic
+    let mnemonic = combine_shares_to_mnemonic(&shares)?;
+
+    Ok(mnemonic.expose_secret().to_string())
 }
 
 #[cfg(test)]

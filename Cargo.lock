@@ -1129,6 +1129,7 @@ name = "frozenkrill"
 version = "0.0.0"
 dependencies = [
  "base32",
+ "chrono",
  "clap",
  "const_format",
  "current_platform",

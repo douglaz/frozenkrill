@@ -1,11 +1,21 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use dialoguer::{console::Term, theme::Theme, Confirm};
+use dialoguer::{Confirm, console::Term, theme::Theme};
 use frozenkrill_core::{
+    PaddingParams,
     anyhow::{self, Context},
     bitcoin::secp256k1::{All, Secp256k1},
-    secret_sharing::{split_mnemonic, Share},
-    wallet_description::SingleSigWalletDescriptionV0,
+    generate_encrypted_encoded_vss_wallet, get_padder,
+    key_derivation::{KeyDerivationDifficulty, default_derive_key},
+    random_generation_utils::{self, get_random_key},
+    secrecy::{ExposeSecret, SecretBox, SecretString},
+    secret_sharing::split_singlesig_wallet as split_singlesig_wallet_core,
+    wallet_description::{
+        EncryptedWalletVersion, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
+    },
 };
 
 use crate::progress_bar::get_spinner;
@@ -14,12 +24,17 @@ use crate::progress_bar::get_spinner;
 pub(crate) fn split_singlesig_wallet(
     theme: &dyn Theme,
     term: &Term,
-    _secp: &Secp256k1<All>,
+    secp: &Secp256k1<All>,
     wallet: &SingleSigWalletDescriptionV0,
     threshold: u8,
     total_shares: u8,
     output_dir: &Path,
-    rng: &mut (impl frozenkrill_core::rand_core::RngCore + frozenkrill_core::rand_core::CryptoRng),
+    password: &Arc<SecretString>,
+    keyfiles: &[PathBuf],
+    difficulty: KeyDerivationDifficulty,
+    padding_params: &PaddingParams,
+    encrypted_version: EncryptedWalletVersion,
+    rng: &mut (impl frozenkrill_core::rand::RngCore + frozenkrill_core::rand::CryptoRng),
 ) -> anyhow::Result<()> {
     // Validate output directory exists
     anyhow::ensure!(
@@ -34,18 +49,27 @@ pub(crate) fn split_singlesig_wallet(
         output_dir.display()
     );
 
-    // Get the mnemonic from the wallet
-    let mnemonic = wallet.mnemonic();
-
     // Show warning and require confirmation
     println!("\n⚠️  WARNING: Secret Sharing Operation");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("You are about to split your wallet seed into {} shares.", total_shares);
-    println!("You will need at least {} shares to reconstruct the seed.", threshold);
+    println!(
+        "You are about to split your wallet seed into {} shares.",
+        total_shares
+    );
+    println!(
+        "You will need at least {} shares to reconstruct the seed.",
+        threshold
+    );
     println!("\nIMPORTANT SECURITY NOTES:");
     println!("  • Store each share in a SEPARATE, SECURE location");
-    println!("  • Losing {} or more shares = PERMANENT LOSS of funds", total_shares - threshold + 1);
-    println!("  • Anyone with {} or more shares can access your wallet", threshold);
+    println!(
+        "  • Losing {} or more shares = PERMANENT LOSS of funds",
+        total_shares - threshold + 1
+    );
+    println!(
+        "  • Anyone with {} or more shares can access your wallet",
+        threshold
+    );
     println!("  • Shares will be written to: {}", output_dir.display());
     println!("  • This operation is IRREVERSIBLE");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -60,25 +84,31 @@ pub(crate) fn split_singlesig_wallet(
         return Ok(());
     }
 
+    // Convert wallet to JSON format for splitting
+    let spinner = get_spinner("Preparing wallet for splitting...");
+    let wallet_json = SinglesigJsonWalletDescriptionV0::from_wallet_description(wallet, secp)?;
+    spinner.finish_with_message("✓ Wallet prepared");
+
     // Create a spinner for the splitting operation
     let spinner = get_spinner("Splitting seed into shares using Pedersen scheme...");
 
-    // Perform the split
-    let shares = split_mnemonic(mnemonic, threshold, total_shares, rng)
-        .context("Failed to split mnemonic")?;
+    // Perform the split using the core function
+    let vss_wallets =
+        split_singlesig_wallet_core(wallet_json.expose_secret(), threshold, total_shares, rng)
+            .context("Failed to split wallet into shares")?;
 
     spinner.finish_with_message("✓ Seed successfully split into shares");
 
-    // Save shares to files
-    let spinner = get_spinner("Writing shares to files...");
+    // Encrypt and save shares to files
+    let spinner = get_spinner("Encrypting and writing shares to files...");
     let mut saved_files = Vec::new();
 
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
 
-    for share in &shares {
+    for vss_wallet in &vss_wallets {
         let filename = format!(
-            "share-{}-of-{}-{}.json",
-            share.share_index, share.total_shares, timestamp
+            "share-{}-of-{}-{}.frozenkrill",
+            vss_wallet.share_index, vss_wallet.total_shares, timestamp
         );
         let filepath = output_dir.join(&filename);
 
@@ -90,13 +120,41 @@ pub(crate) fn split_singlesig_wallet(
             );
         }
 
-        share.save_to_file(&filepath)
-            .with_context(|| format!("Failed to save share to {}", filepath.display()))?;
+        // Generate encryption parameters for this share
+        let salt = random_generation_utils::get_random_salt(rng)?;
+        let nonce = random_generation_utils::get_random_nonce(rng)?;
+        let header_nonce = random_generation_utils::get_random_nonce(rng)?;
+        let padder = get_padder(rng, padding_params)?;
+
+        // Derive key from password and keyfiles, generate random header key
+        let key = default_derive_key(password, keyfiles, &salt, &difficulty)?;
+        let header_key = SecretBox::from(Box::new(get_random_key(rng)?));
+
+        // Encrypt the share
+        let encrypted_wallet = generate_encrypted_encoded_vss_wallet(
+            &key,
+            header_key,
+            vss_wallet,
+            salt,
+            nonce,
+            header_nonce,
+            padder,
+            encrypted_version,
+        )
+        .context("Failed to encrypt share")?;
+
+        // Write encrypted share to file
+        std::fs::write(&filepath, encrypted_wallet).with_context(|| {
+            format!("Failed to write encrypted share to {}", filepath.display())
+        })?;
 
         saved_files.push(filepath);
     }
 
-    spinner.finish_with_message(format!("✓ {} shares written successfully", shares.len()));
+    spinner.finish_with_message(format!(
+        "✓ {} encrypted shares written successfully",
+        vss_wallets.len()
+    ));
 
     // Display results
     println!("\n✓ Secret sharing completed successfully!");
@@ -109,7 +167,10 @@ pub(crate) fn split_singlesig_wallet(
     println!("NEXT STEPS - Share Distribution Checklist:");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ☐ Verify all {} share files were created", total_shares);
-    println!("  ☐ Test reconstruction with {} shares (see 'combine-secret' command)", threshold);
+    println!(
+        "  ☐ Test reconstruction with {} shares (see 'combine-secret' command)",
+        threshold
+    );
     println!("  ☐ Store each share in a DIFFERENT physical location");
     println!("  ☐ Consider geographic distribution (different cities/countries)");
     println!("  ☐ Document where each share is stored (without storing shares together)");
@@ -130,7 +191,7 @@ pub(crate) fn collect_share_files(share_paths: &[String]) -> anyhow::Result<Vec<
         if path.is_file() {
             share_files.push(path);
         } else if path.is_dir() {
-            // Collect all .json files in directory
+            // Collect all .frozenkrill files in directory
             for entry in std::fs::read_dir(&path)
                 .with_context(|| format!("Failed to read directory: {}", path.display()))?
             {
@@ -141,7 +202,7 @@ pub(crate) fn collect_share_files(share_paths: &[String]) -> anyhow::Result<Vec<
                     && file_path
                         .extension()
                         .and_then(|s| s.to_str())
-                        .map(|s| s.eq_ignore_ascii_case("json"))
+                        .map(|s| s.eq_ignore_ascii_case("frozenkrill"))
                         .unwrap_or(false)
                 {
                     share_files.push(file_path);
@@ -158,30 +219,4 @@ pub(crate) fn collect_share_files(share_paths: &[String]) -> anyhow::Result<Vec<
     );
 
     Ok(share_files)
-}
-
-/// Load and verify share files
-pub(crate) fn load_shares(share_files: &[PathBuf]) -> anyhow::Result<Vec<Share>> {
-    let spinner = get_spinner(format!("Loading {} share files...", share_files.len()));
-
-    let mut shares = Vec::new();
-
-    for (idx, path) in share_files.iter().enumerate() {
-        let share = Share::load_from_file(path)
-            .with_context(|| format!("Failed to load share from {}", path.display()))?;
-
-        spinner.set_message(format!(
-            "Loaded share {}/{}: {} of {}",
-            idx + 1,
-            share_files.len(),
-            share.share_index,
-            share.total_shares
-        ));
-
-        shares.push(share);
-    }
-
-    spinner.finish_with_message(format!("✓ Loaded {} shares successfully", shares.len()));
-
-    Ok(shares)
 }

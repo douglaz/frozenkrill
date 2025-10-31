@@ -379,6 +379,59 @@ pub fn generate_encrypted_encoded_multisig_wallet(
         .context("failure encoding encrypted wallet")
 }
 
+/// Generate an encrypted VSS share wallet
+pub fn generate_encrypted_encoded_vss_wallet(
+    key: &SecretBox<[u8; KEY_SIZE]>,
+    header_key: SecretBox<[u8; KEY_SIZE]>,
+    vss_wallet: &wallet_description::VssJsonWalletDescriptionV0,
+    salt: [u8; SALT_SIZE],
+    nonce: [u8; NONCE_SIZE],
+    header_nonce: [u8; NONCE_SIZE],
+    padder: CiphertextPadder,
+    encrypted_version: EncryptedWalletVersion,
+) -> anyhow::Result<Vec<u8>> {
+    let compressed: SecretBox<Vec<u8>> = {
+        let json = vss_wallet.to_vec()?;
+        SecretBox::from(Box::new(
+            compress(json.expose_secret()).context("failure compressing json")?,
+        ))
+    };
+    let ciphertext = default_encrypt(&header_key, &header_nonce, &compressed)
+        .context("failure encrypting wallet")?;
+    let header = DecodedHeaderV0::new(
+        header_key,
+        header_nonce,
+        encrypted_version,
+        ciphertext.len().try_into().with_context(|| {
+            format!(
+                "resulting ciphertext is too big: {} bytes",
+                ciphertext.len()
+            )
+        })?,
+    );
+    let mut encrypted_header = [0u8; ENCRYPTED_HEADER_LENGTH];
+    encrypted_header.copy_from_slice(
+        &default_encrypt(
+            key,
+            &nonce,
+            &header.serialize().context("failure encoding header")?,
+        )
+        .context("failure encrypting header")?[..ENCRYPTED_HEADER_LENGTH],
+    );
+    let mut ciphertext = ciphertext;
+    match encrypted_version {
+        EncryptedWalletVersion::V0Standard => {
+            padder.pad(&mut ciphertext)?;
+        }
+        EncryptedWalletVersion::V0CompactMainnet | EncryptedWalletVersion::V0CompactTestnet => {
+            debug!("Ignoring padder as we are generating a compact wallet");
+        }
+    };
+    EncryptedWalletDescription::new(nonce, salt, encrypted_header, ciphertext)
+        .serialize()
+        .context("failure encoding encrypted VSS wallet")
+}
+
 fn expand_keyfiles(keyfiles: &[String]) -> anyhow::Result<Vec<PathBuf>> {
     let mut result = Vec::new();
     for keyfile in keyfiles {
@@ -414,7 +467,7 @@ pub const DEFAULT_MAX_ADDITIONAL_PADDING: u32 = 1000;
 pub const MAX_ADDITIONAL_PADDING: u32 = 1_000_000_000;
 
 pub fn get_padder(
-    rng: &mut impl CryptoRng,
+    rng: &mut (impl CryptoRng + rand::RngCore),
     params: &PaddingParams,
 ) -> anyhow::Result<CiphertextPadder> {
     if params.disable_all_padding {
