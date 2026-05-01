@@ -92,18 +92,26 @@ pub struct CiphertextPadder {
 impl CiphertextPadder {
     pub fn pad(self, ciphertext: &mut Vec<u8>) -> anyhow::Result<()> {
         if let Some(base_padding_bytes) = self.base_padding_bytes {
-            anyhow::ensure!(
-                ciphertext.len() <= MINIMUM_CIPHERTEXT_SIZE_BYTES,
-                "Pre padded ciphertext size {} is already greater than {MINIMUM_CIPHERTEXT_SIZE_BYTES}",
-                ciphertext.len()
-            );
-            ciphertext.extend_from_slice(&base_padding_bytes);
-            anyhow::ensure!(
-                ciphertext.len() >= MINIMUM_CIPHERTEXT_SIZE_BYTES,
-                "Not enough padding bytes to bring ciphertext size from {} to at least {MINIMUM_CIPHERTEXT_SIZE_BYTES}",
-                ciphertext.len()
-            );
-            ciphertext.truncate(MINIMUM_CIPHERTEXT_SIZE_BYTES);
+            // The base-padding step exists to enforce a *minimum*
+            // ciphertext size — every file is padded out to
+            // `MINIMUM_CIPHERTEXT_SIZE_BYTES` so smaller-than-minimum
+            // payloads can't be distinguished by file size. When the
+            // payload is already at or above that minimum (this is the
+            // normal case for VSS shares of 24-word wallets, which
+            // carry an extra secret/blinder half plus a second Pedersen
+            // verifier set), there is nothing to do here — the size
+            // floor is already satisfied. Skip the base-padding step
+            // rather than hard-erroring, otherwise `split-secret` would
+            // refuse to write a perfectly valid larger share.
+            if ciphertext.len() < MINIMUM_CIPHERTEXT_SIZE_BYTES {
+                ciphertext.extend_from_slice(&base_padding_bytes);
+                anyhow::ensure!(
+                    ciphertext.len() >= MINIMUM_CIPHERTEXT_SIZE_BYTES,
+                    "Not enough padding bytes to bring ciphertext size from {} to at least {MINIMUM_CIPHERTEXT_SIZE_BYTES}",
+                    ciphertext.len()
+                );
+                ciphertext.truncate(MINIMUM_CIPHERTEXT_SIZE_BYTES);
+            }
         }
         if let Some(mut additional_padding_bytes) = self.additional_padding_bytes {
             ciphertext.append(&mut additional_padding_bytes);
@@ -379,7 +387,12 @@ pub fn generate_encrypted_encoded_multisig_wallet(
         .context("failure encoding encrypted wallet")
 }
 
-/// Generate an encrypted VSS share wallet
+/// Generate an encrypted VSS share wallet.
+///
+/// Only `EncryptedWalletVersion::V0Standard` is supported; the compact
+/// variants are rejected here because the corresponding decrypt path
+/// (`decrypt_vss`) cannot decode them — accepting them in the encoder would
+/// silently produce share files that nothing can ever reopen.
 pub fn generate_encrypted_encoded_vss_wallet(
     key: &SecretBox<[u8; KEY_SIZE]>,
     header_key: SecretBox<[u8; KEY_SIZE]>,
@@ -390,6 +403,10 @@ pub fn generate_encrypted_encoded_vss_wallet(
     padder: CiphertextPadder,
     encrypted_version: EncryptedWalletVersion,
 ) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        matches!(encrypted_version, EncryptedWalletVersion::V0Standard),
+        "VSS share encoding only supports V0Standard (got {encrypted_version:?}); the compact format cannot be decrypted"
+    );
     let compressed: SecretBox<Vec<u8>> = {
         let json = vss_wallet.to_vec()?;
         SecretBox::from(Box::new(
@@ -419,14 +436,8 @@ pub fn generate_encrypted_encoded_vss_wallet(
         .context("failure encrypting header")?[..ENCRYPTED_HEADER_LENGTH],
     );
     let mut ciphertext = ciphertext;
-    match encrypted_version {
-        EncryptedWalletVersion::V0Standard => {
-            padder.pad(&mut ciphertext)?;
-        }
-        EncryptedWalletVersion::V0CompactMainnet | EncryptedWalletVersion::V0CompactTestnet => {
-            debug!("Ignoring padder as we are generating a compact wallet");
-        }
-    };
+    // Only V0Standard reaches this point (enforced above), so always pad.
+    padder.pad(&mut ciphertext)?;
     EncryptedWalletDescription::new(nonce, salt, encrypted_header, ciphertext)
         .serialize()
         .context("failure encoding encrypted VSS wallet")

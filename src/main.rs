@@ -34,6 +34,7 @@ use frozenkrill_core::{
 use clap::{Parser, Subcommand};
 
 use dialoguer::{
+    Confirm,
     console::Term,
     theme::{ColorfulTheme, SimpleTheme, Theme},
 };
@@ -548,12 +549,43 @@ struct SplitSecretArgs {
         default_value_t = DEFAULT_MAX_ADDITIONAL_PADDING
     )]
     max_additional_padding_bytes: u32,
+    // No `--wallet-file-type` here: VSS share files are always written
+    // in the standard format. The compact format cannot be decrypted
+    // by `combine-secret`, so accepting it as an option would just
+    // promise a value that always errors. Forcing the Standard value
+    // unconditionally keeps the help output honest.
+    //
+    // The flags below let the user encrypt the share files with a
+    // *different* credential set than the source wallet was opened with.
+    // Common case: the source wallet has password X (which was just used
+    // to decrypt it), but you want to give shares to N different
+    // recipients each protected under a separate share password Y. If
+    // any of these are unset we fall back to the corresponding common
+    // open flag, so the existing single-credential workflow keeps
+    // working unchanged.
     #[clap(
         long,
-        help = WALLET_FILE_TYPE_HELP,
-        default_value_t = WalletFileType::Standard
+        env = "FROZENKRILL_SHARE_PASSWORD",
+        help = "Password used to encrypt the share files. Defaults to the same password used to open the source wallet."
     )]
-    wallet_file_type: WalletFileType,
+    share_password: Option<String>,
+    #[clap(
+        long,
+        help = "Keyfile(s) used (alongside --share-password) to encrypt the share files. Defaults to the wallet-open --keyfile values when unset. Use --no-share-keyfile to force shares to be encrypted without any keyfiles even when the wallet was opened with one."
+    )]
+    share_keyfile: Vec<String>,
+    #[clap(
+        long,
+        action,
+        conflicts_with = "share_keyfile",
+        help = "Encrypt the share files without any keyfiles, even if the source wallet was opened with --keyfile. Use this to produce password-only shares from a keyfile-protected wallet."
+    )]
+    no_share_keyfile: bool,
+    #[clap(
+        long,
+        help = "KDF difficulty for the share-encryption key. Defaults to the wallet-open --difficulty when unset."
+    )]
+    share_difficulty: Option<KeyDerivationDifficulty>,
 }
 
 #[derive(clap::Args)]
@@ -561,12 +593,45 @@ struct SplitSecretArgs {
 struct CombineSecretArgs {
     #[clap(help = "Paths to share files or directories containing share files")]
     share_paths: Vec<String>,
+    /// Kept for backwards compatibility — the recovered mnemonic is now
+    /// printed unconditionally, since the only point of `combine-secret`
+    /// is to surface the seed for the user to act on.
     #[clap(
         long,
         action,
-        help = "Display the reconstructed mnemonic phrase (WARNING: will show secret on screen)"
+        hide = true,
+        help = "Deprecated: the mnemonic is always displayed on success."
     )]
     display_mnemonic: bool,
+    #[clap(
+        long,
+        help = KEYFILE_HELP
+    )]
+    keyfile: Vec<String>,
+    #[clap(
+        long,
+        help = DIFFICULTY_HELP,
+        default_value_t = key_derivation::DEFAULT_DIFFICULTY_LEVEL
+    )]
+    difficulty: KeyDerivationDifficulty,
+    /// Password to decrypt the share files. We deliberately do NOT
+    /// bind a clap `env` here so an explicit `--password ...` cleanly
+    /// overrides any environment variables on the same invocation.
+    /// Env-based fallback is handled at the call site, in this
+    /// priority: explicit --password > FROZENKRILL_SHARE_PASSWORD env
+    /// > interactive prompt. The generic PASSWORD env (used by other
+    /// wallet-open commands) is intentionally NOT consulted here —
+    /// shares carry their own credentials (see `--share-password`)
+    /// that may legitimately differ from the source wallet's
+    /// password, and silently inheriting PASSWORD would turn a
+    /// keyfile-only share recovery (empty share password) into a
+    /// confusing "wrong password" loop. For empty-password shares,
+    /// pass `--password ""` explicitly.
+    #[clap(
+        long,
+        help = "Password to decrypt the share files. Explicit --password overrides the FROZENKRILL_SHARE_PASSWORD env var; if neither is set you'll be prompted interactively (which accepts empty input for keyfile-only share sets). The generic PASSWORD env is NOT consulted here — shares have their own credentials separate from the source wallet's password."
+    )]
+    password: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -882,30 +947,301 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             )?
         }
         Commands::SplitSecret(args) => {
-            // Parse keyfiles and get password before opening wallet
-            // We need the password for both opening and encrypting shares
+            // VSS share files are always written in the standard format —
+            // there is no `--wallet-file-type` flag here.
+
+            // Run the offline-only safety gate BEFORE we ask the user
+            // for any credentials. The wallet password and (in duress
+            // mode) the BIP-39 passphrase are sensitive secrets; the
+            // user shouldn't be prompted to type them on a connected
+            // host that we'd then refuse anyway. This mirrors the
+            // open/show-secrets flows.
+            let mut ic = ic;
+            ic.check()?;
+
+            // Validate cheap CLI inputs (M-of-N pair, output dir,
+            // padding range) BEFORE asking for any secret. Otherwise
+            // a command that's guaranteed to fail downstream would
+            // still collect the wallet password and (in duress mode)
+            // the BIP-39 passphrase from the user.
+            anyhow::ensure!(
+                args.threshold >= 2 && args.total_shares >= 2,
+                "Threshold and total shares must each be at least 2 (got threshold={}, total_shares={})",
+                args.threshold,
+                args.total_shares
+            );
+            anyhow::ensure!(
+                args.threshold <= args.total_shares,
+                "Threshold ({}) cannot exceed total shares ({})",
+                args.threshold,
+                args.total_shares
+            );
+            let preflight_output_dir = std::path::Path::new(&args.output_dir);
+            anyhow::ensure!(
+                preflight_output_dir.exists(),
+                "Output directory does not exist: {}",
+                preflight_output_dir.display()
+            );
+            anyhow::ensure!(
+                preflight_output_dir.is_dir(),
+                "Output path is not a directory: {}",
+                preflight_output_dir.display()
+            );
+            anyhow::ensure!(
+                args.min_additional_padding_bytes <= args.max_additional_padding_bytes,
+                "min_additional_padding_bytes ({}) must be <= max_additional_padding_bytes ({})",
+                args.min_additional_padding_bytes,
+                args.max_additional_padding_bytes
+            );
+            // Preflight the source wallet path too, so a missing /
+            // unreadable input file is rejected before we collect any
+            // secrets. The downstream open path would error eventually
+            // either way, but only after `ask_password` (and, in
+            // duress mode, the BIP-39 passphrase prompt) had run.
+            let preflight_wallet_input =
+                std::path::Path::new(&args.common.wallet_input_file);
+            anyhow::ensure!(
+                preflight_wallet_input.exists(),
+                "Source wallet file does not exist: {}",
+                preflight_wallet_input.display()
+            );
+            anyhow::ensure!(
+                preflight_wallet_input.is_file(),
+                "Source wallet path is not a file: {}",
+                preflight_wallet_input.display()
+            );
+
+            // Pre-resolve the share-keyfile paths (if explicitly
+            // supplied) so unreadable / mistyped paths fail BEFORE we
+            // ask the user for any secret. The result is then reused
+            // by the share-encryption path further down without
+            // re-parsing.
+            let preflight_share_keyfiles: Option<Vec<PathBuf>> =
+                if args.no_share_keyfile || args.share_keyfile.is_empty() {
+                    None
+                } else {
+                    Some(parse_keyfiles_paths(&args.share_keyfile)?)
+                };
+
+            // Show the M-of-N risk warning and require confirmation
+            // BEFORE we ask the user for any secret. If they cancel at
+            // the warning, we don't want to have already prompted for
+            // (and held in memory) the wallet password and — in duress
+            // mode — the BIP-39 passphrase. Putting the prompt here
+            // also means a typo / cancel costs zero credential entry.
+            println!("\n⚠️  WARNING: Secret Sharing Operation");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!(
+                "You are about to split your wallet seed into {} shares.",
+                args.total_shares
+            );
+            println!(
+                "You will need at least {} shares to reconstruct the seed.",
+                args.threshold
+            );
+            println!("\nIMPORTANT SECURITY NOTES:");
+            println!("  • Store each share in a SEPARATE, SECURE location");
+            println!(
+                "  • Losing {} or more shares = PERMANENT LOSS of funds",
+                args.total_shares - args.threshold + 1
+            );
+            println!(
+                "  • Anyone with {} or more shares can access your wallet",
+                args.threshold
+            );
+            println!(
+                "  • Shares will be written to: {}",
+                preflight_output_dir.display()
+            );
+            println!("  • This operation is IRREVERSIBLE");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+            let confirmed = Confirm::with_theme(theme.as_ref())
+                .with_prompt("Do you understand the risks and want to proceed?")
+                .default(false)
+                .interact_on(term)?;
+
+            if !confirmed {
+                println!("Operation cancelled by user.");
+                return Ok(());
+            }
+
+            // Parse keyfiles and get password before opening wallet.
+            // We need the password for both opening and encrypting shares,
+            // so keep it in the `SecretString` wrapper end-to-end rather
+            // than round-tripping through a plain `String` (which would
+            // leave a non-zeroizing copy on the heap until the open
+            // completes).
+            //
+            // We deliberately do NOT use the global `ask_password()`
+            // helper here. That helper requires a confirmation re-entry
+            // and rejects empty input — both correct for *creating*
+            // credentials, both wrong for *entering existing* ones.
+            // In particular, a wallet created keyfile-only (empty
+            // password + one or more keyfiles) is a valid configuration
+            // supported by the rest of the CLI via `--password ""`;
+            // the interactive split-secret flow must be able to open
+            // that wallet too. Allowing empty input here mirrors what
+            // `combine-secret` does when prompting for the share
+            // decryption credential.
             let keyfiles = parse_keyfiles_paths(&args.common.keyfile)?;
             let password = match args.common.password.clone() {
                 Some(p) => Arc::new(SecretString::new(p.into())),
-                None => ask_password(theme.as_ref(), term).map(Arc::new)?,
+                None => {
+                    let typed = dialoguer::Password::with_theme(theme.as_ref())
+                        .with_prompt("Source wallet password (leave blank for keyfile-only wallets)")
+                        .allow_empty_password(true)
+                        .interact_on(term)
+                        .context("failure reading source wallet password")?;
+                    Arc::new(SecretString::new(typed.into()))
+                }
             };
 
-            // Open the wallet using the same password
+            // Build the open args without the password field; we pass the
+            // already-wrapped SecretString in directly.
+            //
+            // We deliberately set `enable_duress_wallet: false` on the
+            // open args even when the user passed `--enable-duress-wallet`.
+            // The shared `singlesig_core_open` path forwards duress mode
+            // into `ask_non_duress_password`, which requires a non-empty
+            // passphrase — and split-secret needs to allow Enter-to-skip
+            // (an empty passphrase = no duress mode). We instead ask
+            // separately here with `ask_optional_non_duress_password`,
+            // which accepts empty input cleanly and returns `None` in
+            // that case.
             let open_args = SinglesigOpenArgs {
                 common: CommonOpenArgs {
                     keyfile: args.common.keyfile.clone(),
                     difficulty: args.common.difficulty,
                     wallet_input_file: args.common.wallet_input_file.clone(),
-                    password: Some(password.expose_secret().to_string()),
+                    password: None,
                 },
-                enable_duress_wallet: args.enable_duress_wallet,
+                enable_duress_wallet: false,
                 command: SinglesigOpenCommands::ShowSecrets(SinglesigShowSecretsArgs {
                     acknowledge_dangerous_operation: true, // Internal call, we know what we're doing
                 }),
             };
 
-            let (wallet, _non_duress_password) =
-                open_singlesig_wallet_non_interactive(theme.as_ref(), term, &secp, ic, &open_args)?;
+            let (wallet, _no_passphrase) =
+                commands::common::singlesig::open_singlesig_wallet_non_interactive_with_password(
+                    theme.as_ref(),
+                    term,
+                    &secp,
+                    ic,
+                    &open_args,
+                    Some(Arc::clone(&password)),
+                )?;
+            let non_duress_password = if args.enable_duress_wallet {
+                ask_optional_non_duress_password(theme.as_ref(), term)?
+            } else {
+                None
+            };
+
+            // Duress-mode handling. The decoy wallet and the real wallet
+            // share the *same* BIP-39 mnemonic — the only difference is the
+            // BIP-39 passphrase, which is mixed in at seed-derivation time
+            // and is *not* part of the mnemonic itself. So splitting the
+            // decoy wallet's mnemonic produces shares that, when combined,
+            // reconstruct that same mnemonic — which is also the real
+            // wallet's mnemonic. The user only needs the BIP-39 passphrase
+            // (from memory) to switch from the decoy view to the real view.
+            //
+            // Critically, we keep the share-file `original_wallet` metadata
+            // pinned to the *decoy* wallet here. The shares are encrypted
+            // with the same wallet password the user typed at the prompt,
+            // and in a coercion scenario that password is precisely what
+            // the attacker is most likely to obtain. If the embedded
+            // metadata described the real wallet (xpub, addresses, …), a
+            // single decrypted share would let a coerced attacker prove the
+            // hidden wallet exists — defeating plausible deniability. With
+            // decoy metadata, an attacker who decrypts a share sees only
+            // the decoy.
+            //
+            // We still ask for, and double-check, the non-duress passphrase
+            // to make sure the user actually knows it (otherwise they would
+            // be locked out of the real wallet without realizing it),
+            // because once the shares are written they cannot be amended.
+            // Whether THIS split is in duress mode: yes iff the user
+            // supplied a *non-empty* non-duress passphrase. BIP-39
+            // treats an empty passphrase as the normal wallet, so just
+            // pressing Enter at the duress prompt should NOT mark the
+            // shares as duress (otherwise recovery would later refuse
+            // to open them as a normal share, and the duress warning
+            // would mislead the user). The flag gets baked into each
+            // share's metadata so that `combine-secret` / `to_singlesig`
+            // can later require/refuse a passphrase appropriately at
+            // restore time.
+            let is_duress_split = non_duress_password
+                .as_ref()
+                .is_some_and(|p| !p.expose_secret().is_empty());
+            if is_duress_split && let Some(non_duress_password) = non_duress_password.as_ref() {
+                commands::common::double_check_non_duress_password(
+                    theme.as_ref(),
+                    term,
+                    non_duress_password,
+                )?;
+
+                // Derive the wallet that the user's typed passphrase
+                // would actually open and show its first address. Then
+                // require the user to confirm it's the wallet they
+                // think they're backing up. Without this check, a
+                // *consistent typo* on the duress passphrase passes the
+                // double-check above but produces shares for the wrong
+                // hidden wallet — funds behind the real passphrase
+                // would never be backed up. There's no on-disk witness
+                // for the hidden wallet (by design, for plausible
+                // deniability), so visual confirmation against the
+                // user's own knowledge of their funded address is the
+                // only check available.
+                let candidate_real = wallet.change_seed_password(
+                    &Some(Arc::clone(non_duress_password)),
+                    &secp,
+                )?;
+                let candidate_first_address =
+                    candidate_real.first_receiving_address(&secp)?.to_string();
+                println!("\n⚠️  CONFIRM HIDDEN-WALLET ADDRESS");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("Using the non-duress passphrase you just typed, the hidden");
+                println!("wallet's first receiving address is:");
+                println!();
+                println!("    {candidate_first_address}");
+                println!();
+                println!("If this is NOT the wallet you intend to back up (e.g. the");
+                println!("address does not match the funded wallet you think you have");
+                println!("behind your duress passphrase), the passphrase you typed is");
+                println!("wrong and these shares would silently strand those funds.");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+                let confirmed = Confirm::with_theme(theme.as_ref())
+                    .with_prompt(
+                        "Is this the hidden wallet you want to back up with these shares?",
+                    )
+                    .default(false)
+                    .interact_on(term)?;
+                if !confirmed {
+                    anyhow::bail!(
+                        "User did not confirm the hidden-wallet address — refusing to write \
+                         duress-mode shares that may not back up the intended wallet"
+                    );
+                }
+                drop(candidate_real);
+
+                println!("\n⚠️  DURESS-MODE BACKUP NOTE");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("Each share file embeds DECOY-wallet metadata only — that is");
+                println!("intentional. If a coerced attacker learns the wallet password");
+                println!("they can decrypt one share and see only the decoy's xpub and");
+                println!("first address, never the real wallet's identity.");
+                println!();
+                println!("The split shares back up the SEED, which is the SAME for the");
+                println!("decoy and the real wallet. To restore the real wallet you must");
+                println!("(a) reconstruct the seed via `combine-secret`, AND");
+                println!("(b) supply the non-duress BIP-39 passphrase from memory.");
+                println!("`combine-secret` plus the shares alone yield the decoy view.");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+            }
+            // Use the decoy wallet (`wallet` as returned above) for both
+            // splitting and metadata embedding. We deliberately do NOT call
+            // `change_seed_password` here.
 
             // Create padding params
             let padding_params = PaddingParams::new(
@@ -914,35 +1250,90 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 Some(args.max_additional_padding_bytes),
             )?;
 
-            // Determine encrypted version
-            let encrypted_version = args
-                .wallet_file_type
-                .to_encrypted_wallet_version(wallet.network, wallet.script_type)?;
+            // VSS share files are always V0Standard.
+            let encrypted_version = EncryptedWalletVersion::V0Standard;
+
+            // Resolve the share-encryption credentials. Default to the
+            // wallet-open credentials so the existing single-credential
+            // workflow keeps working unchanged. Override when any of the
+            // `--share-*` flags is set. `--no-share-keyfile` is the
+            // explicit way to say "shares use no keyfiles even though
+            // the wallet did" — needed because an empty
+            // `--share-keyfile` would otherwise be indistinguishable
+            // from the user not passing it at all.
+            let share_keyfiles = if args.no_share_keyfile {
+                Vec::new()
+            } else if let Some(prevalidated) = preflight_share_keyfiles {
+                prevalidated
+            } else {
+                keyfiles.clone()
+            };
+            let share_password = match args.share_password.clone() {
+                Some(p) => Arc::new(SecretString::new(p.into())),
+                None => Arc::clone(&password),
+            };
+            let share_difficulty = args.share_difficulty.unwrap_or(args.common.difficulty);
 
             // Split the wallet
             let output_dir = std::path::PathBuf::from(&args.output_dir);
             commands::split_secret::split_singlesig_wallet(
-                theme.as_ref(),
-                term,
                 &secp,
                 &wallet,
                 args.threshold,
                 args.total_shares,
                 &output_dir,
-                &password,
-                &keyfiles,
-                args.common.difficulty,
+                &share_password,
+                &share_keyfiles,
+                share_difficulty,
                 &padding_params,
                 encrypted_version,
+                is_duress_split,
                 &mut rng,
             )?;
         }
         Commands::CombineSecret(args) => {
+            // combine-secret reconstructs and prints the seed phrase, so
+            // it has to honor the project-wide offline-only safety gate
+            // just like every other command that exposes secrets
+            // (`open ... show-secrets`, `singlesig-generate`, …). Run
+            // `InternetChecker::check()` BEFORE we decrypt any shares
+            // so the user can't accidentally reveal a recovered seed
+            // on an internet-connected machine.
+            let mut ic = ic;
+            ic.check()?;
+            let keyfiles = parse_keyfiles_paths(&args.keyfile)?;
+            // Resolve the share-decryption password in this priority:
+            //   1. Explicit `--password` on the CLI (args.password).
+            //      We deliberately don't bind clap's `env` for this
+            //      arg so an explicit override always wins.
+            //   2. FROZENKRILL_SHARE_PASSWORD env, the same one
+            //      `split-secret --share-password` reads.
+            //   3. Interactive prompt (handled inside combine_shares,
+            //      which accepts empty input for keyfile-only shares).
+            //
+            // We intentionally do NOT fall back to the generic
+            // PASSWORD env here. That variable is the wallet-open
+            // credential for other Frozenkrill commands and may be
+            // set in a shell where the user is recovering shares
+            // that were written keyfile-only (empty share password).
+            // Inheriting PASSWORD as the share password would silently
+            // turn every share decryption into a "wrong password"
+            // error and never reach the interactive empty-password
+            // prompt, breaking the keyfile-only recovery flow with
+            // no useful diagnostic.
+            let password = args
+                .password
+                .clone()
+                .or_else(|| std::env::var("FROZENKRILL_SHARE_PASSWORD").ok())
+                .map(|p| SecretString::new(p.into()));
             commands::combine_secret::combine_shares(
                 theme.as_ref(),
                 term,
                 &args.share_paths,
                 args.display_mnemonic,
+                &keyfiles,
+                args.difficulty,
+                password,
             )?;
         }
         Commands::Interactive(args) => commands::interactive::interactive(
@@ -1074,6 +1465,11 @@ fn ask_password(theme: &dyn Theme, term: &Term) -> anyhow::Result<SecretString> 
 }
 
 fn ask_non_duress_password(theme: &dyn Theme, term: &Term) -> anyhow::Result<Arc<SecretString>> {
+    // The global non-duress prompt requires a non-empty passphrase:
+    // the existing duress-wallet flows (generate, open) need it to
+    // genuinely differ from the decoy. `split-secret` has its own
+    // local prompt (`ask_optional_non_duress_password`) that accepts
+    // empty input and translates that into "no duress mode".
     Ok(Arc::new(SecretString::new(
         dialoguer::Password::with_theme(theme)
             .with_prompt("Enter a non duress seed password")
@@ -1082,6 +1478,29 @@ fn ask_non_duress_password(theme: &dyn Theme, term: &Term) -> anyhow::Result<Arc
             .context("failure reading password")?
             .into(),
     )))
+}
+
+/// Variant of `ask_non_duress_password` used by `split-secret` only.
+/// Accepts empty input and returns `None` in that case. The caller
+/// then treats `None` as "the user does not want duress mode for this
+/// split", and writes normal (non-duress) shares.
+fn ask_optional_non_duress_password(
+    theme: &dyn Theme,
+    term: &Term,
+) -> anyhow::Result<Option<Arc<SecretString>>> {
+    let typed = dialoguer::Password::with_theme(theme)
+        .with_prompt(
+            "Enter the non-duress BIP-39 passphrase (leave blank if the wallet has none)",
+        )
+        .allow_empty_password(true)
+        .with_confirmation("Confirm passphrase", "Passphrases don't match, try again")
+        .interact_on(term)
+        .context("failure reading passphrase")?;
+    if typed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Arc::new(SecretString::new(typed.into()))))
+    }
 }
 
 pub(crate) fn get_derivation_key_spinner() -> ProgressBar {
