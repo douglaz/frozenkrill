@@ -53,7 +53,7 @@ Pedersen VSS solves this by allowing share holders to verify their shares are ge
 
 ⚠️ **Threshold security**: Anyone with M shares can reconstruct your seed and access ALL funds
 ⚠️ **Share loss**: Losing too many shares (>N-M) means PERMANENT loss of funds
-⚠️ **Password protection**: Shares are encrypted - you MUST remember the password used during splitting
+⚠️ **Password protection**: Shares are encrypted - you MUST remember the share password and any share keyfiles used during splitting
 ⚠️ **Under audit**: vsss-rs library includes a warning about audit status - use at your own risk
 ⚠️ **Distribution risk**: The distribution process itself creates temporary risk
 
@@ -80,7 +80,7 @@ frozenkrill split-secret \
   --threshold 3 \
   --total-shares 5 \
   --output-dir /path/to/shares \
-  --password mypassword \
+  --password source-wallet-password \
   --keyfile /path/to/keyfile \
   --difficulty normal
 ```
@@ -90,12 +90,16 @@ frozenkrill split-secret \
 - `--threshold`: Minimum shares needed to reconstruct (M)
 - `--total-shares`: Total shares to create (N)
 - `--output-dir`: Directory where share files will be written (default: current directory)
-- `--password`: Password for encrypting shares (will prompt if not provided)
-- `--keyfile`: Optional keyfile(s) for share encryption
-- `--difficulty`: Key derivation difficulty (easy/normal/hard/veryhard)
+- `--password`: Password used to open the source wallet (will prompt if not provided)
+- `--keyfile`: Optional keyfile(s) used to open the source wallet
+- `--difficulty`: Key derivation difficulty used to open the source wallet (easy/normal/hard/veryhard)
 - `--enable-duress-wallet`: Use duress wallet instead of main wallet
 - `--disable-all-padding`: Disable padding (not recommended)
-- `--wallet-file-type`: standard or compact (default: standard)
+- `--share-password`: Optional password used to encrypt the share files; defaults to the source wallet password
+- `--share-keyfile`: Optional keyfile(s) used to encrypt the share files; defaults to the source wallet keyfiles
+- `--no-share-keyfile`: Encrypt the share files without keyfiles even when the source wallet used keyfiles
+- `--share-difficulty`: Optional key derivation difficulty for share encryption; defaults to the source wallet difficulty
+- VSS share files are always written in the standard encrypted wallet format
 
 **Output:**
 Creates encrypted files named: `share-1-of-5-20251031-120000.frozenkrill`, `share-2-of-5-20251031-120000.frozenkrill`, etc.
@@ -106,13 +110,12 @@ To reconstruct the seed phrase from shares:
 
 ```bash
 frozenkrill combine-secret \
-  share-1-of-5.frozenkrill share-3-of-5.frozenkrill share-4-of-5.frozenkrill \
-  --display-mnemonic
+  share-1-of-5.frozenkrill share-3-of-5.frozenkrill share-4-of-5.frozenkrill
 ```
 
 **Parameters:**
 - Provide M or more share file paths as arguments
-- `--display-mnemonic`: Display the reconstructed mnemonic on screen (⚠️ **SENSITIVE!**)
+- The reconstructed mnemonic is printed on success (⚠️ **SENSITIVE!**)
 
 **Alternative**: Provide a directory and it will use all `.frozenkrill` files found:
 
@@ -140,17 +143,15 @@ Shares are stored as encrypted .frozenkrill wallet files with the following stru
   "created_at": "2025-10-31T12:00:00Z",
   "original_wallet": {
     "version": 0,
-    "sigtype": "single",
+    "sigtype": "singlesig",
     "master_fingerprint": "abcd1234",
     "singlesig_xpub": "xpub...",
     "singlesig_derivation_path": "m/84'/0'/0'",
-    "multisig_xpub": "xpub...",
-    "multisig_derivation_path": "m/48'/0'/0'/2'",
     "singlesig_first_address": "bc1q...",
     "singlesig_receiving_output_descriptor": "wpkh(...)",
     "singlesig_change_output_descriptor": "wpkh(...)",
     "network": "bitcoin",
-    "script_type": "segwit_native",
+    "script_type": "segwit-native",
     "is_duress": false
   }
 }

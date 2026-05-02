@@ -2,7 +2,7 @@
   "active_run": {
     "run_id": "run-20260502051848",
     "stage_cursor": {
-      "stage": "plan_and_implement",
+      "stage": "final_review",
       "cycle": 1,
       "attempt": 1,
       "completion_round": 3
@@ -23,23 +23,10 @@
     "rollback_count": 0
   },
   "amendment_queue": {
-    "pending": [
-      {
-        "amendment_id": "fr-2-d4bb881f",
-        "source_stage": "final_review",
-        "source_cycle": 1,
-        "source_completion_round": 2,
-        "body": "`docs/secret_sharing.md` still documents several stale user-facing details that no longer match the branch: line 98 lists `--wallet-file-type` for `split-secret`, but the CLI explicitly has no such flag and hardcodes VSS shares to `V0Standard` in `src/main.rs:552` and `src/main.rs:1250`; lines 110 and 115 present `--display-mnemonic` as the way to show output, but the flag is hidden/deprecated in `src/main.rs:596` and ignored while the mnemonic is printed unconditionally in `src/commands/combine_secret.rs:168`; lines 143 and 153 show JSON values (`\"single\"`, `\"segwit_native\"`) that do not match the serializers (`\"singlesig\"` at `frozenkrill-core/src/wallet_description.rs:119`, `\"segwit-native\"` at `frozenkrill-core/src/wallet_description.rs:157`). This will lead users following the guide to pass unsupported flags or misunderstand the actual share payload; update the guide to match the current CLI and serialized values.",
-        "created_at": "2026-05-02T05:55:54.013701444Z",
-        "batch_sequence": 1,
-        "source": "workflow_stage",
-        "dedup_key": "ee4392e39d18e4e19067a6e60e455e5d81fca909fde6c598fdfa0c773f89673d",
-        "classification": "fix_current_bead"
-      }
-    ],
-    "processed_count": 1
+    "pending": [],
+    "processed_count": 2
   },
-  "status_summary": "running: final review restart round 3 -> Plan and Implement",
+  "status_summary": "running: completed Plan and Implement, next Final Review",
   "last_stage_resolution_snapshot": {
     "stage_id": "final_review",
     "resolved_at": "2026-05-02T05:48:29.487674763Z",
