@@ -2,7 +2,7 @@
   "active_run": {
     "run_id": "run-20260502013456",
     "stage_cursor": {
-      "stage": "plan_and_implement",
+      "stage": "final_review",
       "cycle": 1,
       "attempt": 1,
       "completion_round": 3
@@ -23,23 +23,10 @@
     "rollback_count": 0
   },
   "amendment_queue": {
-    "pending": [
-      {
-        "amendment_id": "fr-2-5594977e",
-        "source_stage": "final_review",
-        "source_cycle": 1,
-        "source_completion_round": 2,
-        "body": "`combine_vss_wallets` can accept and authenticate recovered metadata from fewer than the threshold number of complete VSS shares. At `frozenkrill-core/src/secret_sharing.rs:1205` it builds `verified_inputs` as the intersection of shares whose low and high halves both verify for the winning 24-word candidate, but `frozenkrill-core/src/secret_sharing.rs:1211` only requires that intersection to be non-empty before deriving metadata. For a 3-of-5 24-word wallet, low-half recovery can succeed from shares {1,2,3} while high-half recovery succeeds from {3,4,5}, leaving only share 3 as a complete verified input. Then `derive_metadata` computes `is_duress` from that one input at `frozenkrill-core/src/secret_sharing.rs:1378`/`frozenkrill-core/src/secret_sharing.rs:1385`; a single tampered complete share with `is_duress=true` becomes a strict majority, `authenticate` can still pass because it validates xpub/network via no-passphrase rebuild, and `VssRecovery::rebuild_singlesig` permits passphrase use when `metadata.is_duress` is true at `frozenkrill-core/src/secret_sharing.rs:83`. Require at least the candidate threshold worth of distinct complete verified share identifiers before accepting a candidate and deriving metadata, or otherwise keep metadata unauthenticated so the candidate is rejected.",
-        "created_at": "2026-05-02T02:33:59.403695230Z",
-        "batch_sequence": 1,
-        "source": "workflow_stage",
-        "dedup_key": "aa3b78a4702d1ed7010a0b6dcf9c20743ce78488b29a9843413ad6cf4b2efdd1",
-        "classification": "fix_current_bead"
-      }
-    ],
-    "processed_count": 1
+    "pending": [],
+    "processed_count": 2
   },
-  "status_summary": "running: final review restart round 3 -> Plan and Implement",
+  "status_summary": "running: completed Plan and Implement, next Final Review",
   "last_stage_resolution_snapshot": {
     "stage_id": "final_review",
     "resolved_at": "2026-05-02T02:16:49.963225032Z",

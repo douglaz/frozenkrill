@@ -362,6 +362,20 @@ fn vsss_share_identifier_from_hex(hex_str: &str) -> Result<VsssScalar> {
     Ok(*vsss_share_from_bytes(&bytes)?.identifier())
 }
 
+fn complete_vsss_share_identifier(
+    wallet: &crate::wallet_description::VssJsonWalletDescriptionV0,
+    has_hi: bool,
+) -> Option<VsssScalar> {
+    let lo_id = vsss_share_identifier_from_hex(&wallet.share_data).ok()?;
+    if has_hi {
+        let hi_id = vsss_share_identifier_from_hex(wallet.share_data_hi.as_deref()?).ok()?;
+        if lo_id != hi_id {
+            return None;
+        }
+    }
+    Some(lo_id)
+}
+
 fn verify_vsss_share_pair(
     verifier_set: &Vec<VsssVerifier>,
     secret_bytes: &[u8],
@@ -1208,12 +1222,21 @@ pub fn combine_vss_wallets(
                         .copied()
                         .filter(|w| verifies_lo(w) && verifies_hi(w))
                         .collect();
-                if !verified_inputs.is_empty() {
+                let complete_verified_ids: std::collections::HashSet<VsssScalar> = verified_inputs
+                    .iter()
+                    .filter_map(|w| complete_vsss_share_identifier(w, hi_hex_opt.is_some()))
+                    .collect();
+                if complete_verified_ids.len() >= candidate_threshold as usize {
                     successes.push((
                         secret,
                         verified_inputs,
                         lo_hex.to_string(),
                         hi_hex_opt.map(|s| s.to_string()),
+                    ));
+                } else {
+                    last_err = Some(anyhow!(
+                        "Candidate recovered mnemonic but only {} complete verified share identifier(s) were present; threshold is {candidate_threshold}",
+                        complete_verified_ids.len()
                     ));
                 }
             }
@@ -2609,6 +2632,65 @@ mod tests {
 
         let recovered = combine_vss_wallets(&vss).unwrap();
         assert_eq!(recovered.mnemonic.expose_secret().to_string(), phrase);
+    }
+
+    /// A 24-word recovery must have threshold many complete share identities:
+    /// the low half and high half may each be independently recoverable, but
+    /// metadata is not authenticated unless the same threshold-sized set of
+    /// cryptographic share identifiers verifies for both halves.
+    #[test]
+    fn test_combine_vss_wallets_rejects_below_threshold_complete_share_ids() {
+        use crate::random_generation_utils::get_secp;
+        use crate::wallet_description::{
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
+        };
+        use std::str::FromStr;
+        use std::sync::Arc;
+
+        fn bump_share_value(hex_share: &mut String) {
+            let bytes = hex::decode(hex_share.as_str()).unwrap();
+            let share = vsss_share_from_bytes(&bytes).unwrap();
+            let value = IdentifierPrimeField(WrappedScalar(share.value().0.0 + Scalar::from(1u64)));
+            let tampered = VsssShare::with_identifier_and_value(*share.identifier(), value);
+            *hex_share = hex::encode(vsss_share_to_bytes(&tampered));
+        }
+
+        let mut rng = rand::thread_rng();
+        let secp = get_secp(&mut rng);
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+        let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
+        let wallet = SingleSigWalletDescriptionV0::generate(
+            Arc::new(mnemonic),
+            &None,
+            bitcoin::Network::Bitcoin,
+            ScriptType::SegwitNative,
+            &secp,
+        )
+        .unwrap();
+        let json =
+            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 3, 5, false, &mut rng).unwrap();
+
+        // Low half can still recover from ids {1,2,3}; high half can
+        // still recover from ids {3,4,5}. Their complete intersection is
+        // only id {3}, below threshold=3, so metadata must not be accepted.
+        for share in vss.iter_mut().skip(3) {
+            bump_share_value(&mut share.share_data);
+        }
+        for share in vss.iter_mut().take(2) {
+            bump_share_value(share.share_data_hi.as_mut().unwrap());
+        }
+
+        let err = match combine_vss_wallets(&vss) {
+            Ok(_) => panic!("expected below-threshold complete-share intersection to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("complete verified share identifier")
+                || msg.contains("No threshold-compatible subset"),
+            "expected complete-share threshold rejection, got: {msg}"
+        );
     }
 
     /// Tamper the share_data hex of one share, then attempt to combine the
