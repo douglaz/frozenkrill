@@ -393,6 +393,7 @@ pub fn generate_encrypted_encoded_multisig_wallet(
 /// variants are rejected here because the corresponding decrypt path
 /// (`decrypt_vss`) cannot decode them — accepting them in the encoder would
 /// silently produce share files that nothing can ever reopen.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_encrypted_encoded_vss_wallet(
     key: &SecretBox<[u8; KEY_SIZE]>,
     header_key: SecretBox<[u8; KEY_SIZE]>,

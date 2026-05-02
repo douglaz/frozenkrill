@@ -25,14 +25,21 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use bip39::Mnemonic;
+use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar;
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
-use curve25519_dalek::ristretto::CompressedRistretto;
 use std::str::FromStr;
 use vsss_rs::curve25519::{WrappedRistretto, WrappedScalar};
 use vsss_rs::pedersen::{StdPedersenResult, split_secret};
-use vsss_rs::{PedersenResult, PedersenVerifierSet, combine_shares};
+use vsss_rs::{
+    DefaultShare, IdentifierPrimeField, PedersenResult, PedersenVerifierSet, ReadableShareSet,
+    Share as VsssShareTrait, ShareElement, ValueGroup,
+};
+
+type VsssScalar = IdentifierPrimeField<WrappedScalar>;
+type VsssShare = DefaultShare<VsssScalar, VsssScalar>;
+type VsssVerifier = ValueGroup<WrappedRistretto>;
 
 /// Result of a successful `combine_vss_wallets`. Bundles the recovered
 /// mnemonic with the chosen share group's public metadata so callers can
@@ -87,20 +94,23 @@ impl VssRecovery {
         // + Mnemonic::from_str`. The String round-trip would leave a
         // non-zeroizing copy of the seed phrase on the heap on every
         // successful recovery sanity-check.
-        let mnemonic_arc: Arc<SecretBox<bip39::Mnemonic>> =
-            Arc::new(SecretBox::new(Box::new(self.mnemonic.expose_secret().clone())));
+        let mnemonic_arc: Arc<SecretBox<bip39::Mnemonic>> = Arc::new(SecretBox::new(Box::new(
+            self.mnemonic.expose_secret().clone(),
+        )));
         let network = bitcoin::Network::from_str(&self.metadata.network).with_context(|| {
-            format!("invalid network in recovery metadata: {}", self.metadata.network)
-        })?;
-        let script_type = crate::wallet_description::ScriptType::from_str(
-            &self.metadata.script_type,
-        )
-        .with_context(|| {
             format!(
-                "invalid script type in recovery metadata: {}",
-                self.metadata.script_type
+                "invalid network in recovery metadata: {}",
+                self.metadata.network
             )
         })?;
+        let script_type =
+            crate::wallet_description::ScriptType::from_str(&self.metadata.script_type)
+                .with_context(|| {
+                    format!(
+                        "invalid script type in recovery metadata: {}",
+                        self.metadata.script_type
+                    )
+                })?;
 
         // Authenticate the metadata against the no-passphrase wallet
         // first (catches tampered network / script_type / xpub even
@@ -164,6 +174,14 @@ pub enum SecretSharingError {
 }
 
 /// Internal representation of a single share of a split secret.
+///
+/// vsss-rs 5.x uses typed shares rather than the v4 raw byte format. The
+/// persisted `share_data` and `blinder_share_data` hex strings in this crate
+/// encode one typed Curve25519/Ristretto scalar share as
+/// `identifier || value`, where both fields are 32-byte canonical
+/// `WrappedScalar` encodings. The first byte is no longer the share
+/// identifier; all identifier reads must deserialize the typed identifier
+/// field before dedupe, verification, or metadata voting.
 ///
 /// Entropy is split into two independent 16-byte halves and each half is shared
 /// via its own Pedersen VSS instance. 12-word mnemonics (16 bytes of entropy)
@@ -285,7 +303,6 @@ impl Share {
         }
         Ok(())
     }
-
 }
 
 // `Share::save_to_file` / `load_from_file` were intentionally removed:
@@ -318,6 +335,64 @@ fn scalar_to_entropy_half(scalar: &WrappedScalar) -> [u8; 16] {
     let mut half = [0u8; 16];
     half.copy_from_slice(&bytes[..16]);
     half
+}
+
+fn vsss_share_to_bytes(share: &VsssShare) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(share.identifier().to_vec().as_slice());
+    out.extend_from_slice(share.value().to_vec().as_slice());
+    out
+}
+
+fn vsss_share_from_bytes(bytes: &[u8]) -> Result<VsssShare> {
+    anyhow::ensure!(
+        bytes.len() == 64,
+        "vsss-rs 5 share must be 64 bytes: 32-byte identifier + 32-byte value (got {})",
+        bytes.len()
+    );
+    let identifier = VsssScalar::from_slice(&bytes[..32])
+        .map_err(|e| anyhow!("invalid vsss-rs share identifier: {:?}", e))?;
+    let value = VsssScalar::from_slice(&bytes[32..])
+        .map_err(|e| anyhow!("invalid vsss-rs share value: {:?}", e))?;
+    Ok(VsssShare::with_identifier_and_value(identifier, value))
+}
+
+fn vsss_share_identifier_from_hex(hex_str: &str) -> Result<VsssScalar> {
+    let bytes = hex::decode(hex_str).context("Failed to decode vsss-rs share hex")?;
+    Ok(*vsss_share_from_bytes(&bytes)?.identifier())
+}
+
+fn complete_vsss_share_identifier(
+    wallet: &crate::wallet_description::VssJsonWalletDescriptionV0,
+    has_hi: bool,
+) -> Option<VsssScalar> {
+    let lo_id = vsss_share_identifier_from_hex(&wallet.share_data).ok()?;
+    if has_hi {
+        let hi_id = vsss_share_identifier_from_hex(wallet.share_data_hi.as_deref()?).ok()?;
+        if lo_id != hi_id {
+            return None;
+        }
+    }
+    Some(lo_id)
+}
+
+fn verify_vsss_share_pair(
+    verifier_set: &Vec<VsssVerifier>,
+    secret_bytes: &[u8],
+    blinder_bytes: &[u8],
+) -> bool {
+    let Ok(secret_share) = vsss_share_from_bytes(secret_bytes) else {
+        return false;
+    };
+    let Ok(blinder_share) = vsss_share_from_bytes(blinder_bytes) else {
+        return false;
+    };
+    if secret_share.identifier() != blinder_share.identifier() {
+        return false;
+    }
+    verifier_set
+        .verify_share_and_blinder(&secret_share, &blinder_share)
+        .is_ok()
 }
 
 /// Reassemble entropy halves into a mnemonic of the requested word count.
@@ -416,9 +491,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     for idx in 0..(total_shares as usize) {
         let share_data = hex::encode(&lo_split.share_bytes[idx]);
         let blinder_share_data = hex::encode(&lo_split.blinder_bytes[idx]);
-        let share_data_hi = hi_split
-            .as_ref()
-            .map(|h| hex::encode(&h.share_bytes[idx]));
+        let share_data_hi = hi_split.as_ref().map(|h| hex::encode(&h.share_bytes[idx]));
         let blinder_share_data_hi = hi_split
             .as_ref()
             .map(|h| hex::encode(&h.blinder_bytes[idx]));
@@ -473,10 +546,11 @@ fn split_one_scalar<R: rand::RngCore + rand::CryptoRng>(
     total_shares: u8,
     rng: &mut R,
 ) -> Result<VssOneScalar> {
-    let result: StdPedersenResult<WrappedRistretto, u8, Vec<u8>> = split_secret(
+    let secret = IdentifierPrimeField(scalar);
+    let result: StdPedersenResult<VsssShare, VsssVerifier> = split_secret(
         threshold as usize,
         total_shares as usize,
-        scalar,
+        &secret,
         None,
         None,
         None,
@@ -484,13 +558,21 @@ fn split_one_scalar<R: rand::RngCore + rand::CryptoRng>(
     )
     .map_err(|e| anyhow!("Failed to split secret: {:?}", e))?;
 
-    let share_bytes: Vec<Vec<u8>> = result.secret_shares().to_vec();
-    let blinder_bytes: Vec<Vec<u8>> = result.blinder_shares().to_vec();
+    let share_bytes: Vec<Vec<u8>> = result
+        .secret_shares()
+        .iter()
+        .map(vsss_share_to_bytes)
+        .collect();
+    let blinder_bytes: Vec<Vec<u8>> = result
+        .blinder_shares()
+        .iter()
+        .map(vsss_share_to_bytes)
+        .collect();
     debug_assert_eq!(share_bytes.len(), blinder_bytes.len());
     let pedersen_hex: Vec<String> = result
         .pedersen_verifier_set()
         .iter()
-        .map(|v| hex::encode(v.0.compress().to_bytes()))
+        .map(|v| hex::encode(v.0.0.compress().to_bytes()))
         .collect();
 
     Ok(VssOneScalar {
@@ -501,8 +583,8 @@ fn split_one_scalar<R: rand::RngCore + rand::CryptoRng>(
 }
 
 /// Parse a comma-separated list of hex-encoded Ristretto points back into a
-/// `Vec<WrappedRistretto>`. Used to deserialize the Pedersen verifier set.
-fn parse_ristretto_points(s: &str) -> Result<Vec<WrappedRistretto>> {
+/// `Vec<VsssVerifier>`. Used to deserialize the Pedersen verifier set.
+fn parse_ristretto_points(s: &str) -> Result<Vec<VsssVerifier>> {
     let mut out = Vec::new();
     for hex_str in s.split(',') {
         let bytes = hex::decode(hex_str).context("Failed to decode verifier hex")?;
@@ -517,13 +599,13 @@ fn parse_ristretto_points(s: &str) -> Result<Vec<WrappedRistretto>> {
         let point = compressed
             .decompress()
             .ok_or_else(|| anyhow!("verifier point is not a valid Ristretto encoding"))?;
-        out.push(WrappedRistretto(point));
+        out.push(ValueGroup(WrappedRistretto(point)));
     }
     Ok(out)
 }
 
 /// Filter (secret_share, blinder_share) pairs down to those that pass
-/// Pedersen verification, deduped by share identifier (first byte).
+/// Pedersen verification, deduped by typed share identifier.
 ///
 /// Pedersen `verify_share_and_blinder` checks that the Pedersen commitment
 /// `C(x_i) = g^a(x_i) * h^b(x_i)` equals the value implied by the share's
@@ -540,7 +622,7 @@ fn verified_unique_share_pairs(
     secret_shares: &[Vec<u8>],
     blinder_shares: &[Vec<u8>],
     pedersen_hex: &str,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Vec<VsssShare>> {
     anyhow::ensure!(
         secret_shares.len() == blinder_shares.len(),
         "secret-share count ({}) does not match blinder-share count ({})",
@@ -554,11 +636,26 @@ fn verified_unique_share_pairs(
         verifier_vec.len()
     );
     let mut seen_ids = std::collections::HashSet::new();
-    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut out: Vec<VsssShare> = Vec::new();
     let mut last_failure: Option<String> = None;
-    for (secret_share, blinder_share) in secret_shares.iter().zip(blinder_shares.iter()) {
-        let secret_id = secret_share.first().copied();
-        let blinder_id = blinder_share.first().copied();
+    for (secret_share_bytes, blinder_share_bytes) in secret_shares.iter().zip(blinder_shares.iter())
+    {
+        let secret_share = match vsss_share_from_bytes(secret_share_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                last_failure = Some(format!("secret-share failed to parse: {e:#}"));
+                continue;
+            }
+        };
+        let blinder_share = match vsss_share_from_bytes(blinder_share_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                last_failure = Some(format!("blinder-share failed to parse: {e:#}"));
+                continue;
+            }
+        };
+        let secret_id = *secret_share.identifier();
+        let blinder_id = *blinder_share.identifier();
         if secret_id != blinder_id {
             last_failure = Some(format!(
                 "secret-share/blinder-share identifier mismatch: {:?} vs {:?}",
@@ -568,7 +665,7 @@ fn verified_unique_share_pairs(
         }
         // verify_share_and_blinder rejects shares whose identifier is zero.
         if verifier_vec
-            .verify_share_and_blinder(secret_share, blinder_share)
+            .verify_share_and_blinder(&secret_share, &blinder_share)
             .is_err()
         {
             last_failure = Some(format!(
@@ -577,17 +674,14 @@ fn verified_unique_share_pairs(
             ));
             continue;
         }
-        match secret_id {
-            Some(id) if seen_ids.insert(id) => out.push(secret_share.clone()),
-            _ => {} // duplicate identifier (already accepted) or empty share
+        if seen_ids.insert(secret_id) {
+            out.push(secret_share);
         }
     }
     if out.is_empty() {
-        bail!(
-            anyhow!(SecretSharingError::VerificationFailed).context(
-                last_failure.unwrap_or_else(|| "no shares supplied for verification".to_string())
-            )
-        );
+        bail!(anyhow!(SecretSharingError::VerificationFailed).context(
+            last_failure.unwrap_or_else(|| "no shares supplied for verification".to_string())
+        ));
     }
     Ok(out)
 }
@@ -623,7 +717,10 @@ pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<M
     let mut groups: std::collections::BTreeMap<GroupKey, Vec<&Share>> =
         std::collections::BTreeMap::new();
     for s in shares {
-        let key: GroupKey = (s.verification_data.as_str(), s.verification_data_hi.as_deref());
+        let key: GroupKey = (
+            s.verification_data.as_str(),
+            s.verification_data_hi.as_deref(),
+        );
         groups.entry(key).or_default().push(s);
     }
     // Pick the largest group (ties broken arbitrarily — within a single
@@ -780,9 +877,10 @@ fn combine_one_half(
         "Insufficient verified shares: needed at least {threshold}, got {}",
         good.len()
     );
-    let combined: WrappedScalar =
-        combine_shares(&good).map_err(|e| anyhow!("Failed to combine shares: {:?}", e))?;
-    Ok(Some(combined))
+    let combined: VsssScalar = good
+        .combine()
+        .map_err(|e| anyhow!("Failed to combine shares: {:?}", e))?;
+    Ok(Some(combined.0))
 }
 
 /// Split a singlesig wallet into VSS shares
@@ -825,12 +923,14 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     // invariant for callers that bypass the CLI.
     {
         let secp_check = crate::random_generation_utils::get_secp(rng);
-        let network = bitcoin::Network::from_str(&wallet.network).with_context(|| {
-            format!("invalid network in wallet metadata: {}", wallet.network)
-        })?;
+        let network = bitcoin::Network::from_str(&wallet.network)
+            .with_context(|| format!("invalid network in wallet metadata: {}", wallet.network))?;
         let script_type = crate::wallet_description::ScriptType::from_str(&wallet.script_type)
             .with_context(|| {
-                format!("invalid script type in wallet metadata: {}", wallet.script_type)
+                format!(
+                    "invalid script type in wallet metadata: {}",
+                    wallet.script_type
+                )
             })?;
         let no_passphrase_witness =
             crate::wallet_description::SingleSigWalletDescriptionV0::generate(
@@ -864,8 +964,8 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     // `Share` is dropped (and zeroized) at the end of the iteration.
     let mut vss_wallets = Vec::with_capacity(shares.len());
     for share in &shares {
-        let mnemonic_length = u8::try_from(share.mnemonic_length)
-            .context("mnemonic length does not fit in u8")?;
+        let mnemonic_length =
+            u8::try_from(share.mnemonic_length).context("mnemonic length does not fit in u8")?;
         let vss_wallet = crate::wallet_description::VssJsonWalletDescriptionV0::from_singlesig(
             wallet,
             share.share_index,
@@ -921,8 +1021,7 @@ pub fn combine_vss_wallets(
     // discard the share's secret bytes for it.
     let vss_wallets_owned: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
         vss_wallets.iter().collect();
-    let vss_wallets: &[&crate::wallet_description::VssJsonWalletDescriptionV0] =
-        &vss_wallets_owned;
+    let vss_wallets: &[&crate::wallet_description::VssJsonWalletDescriptionV0] = &vss_wallets_owned;
 
     // Iterate verifier *candidates* — pairs of (lo_verifier_hex,
     // optional hi_verifier_hex) found in the input — instead of
@@ -957,11 +1056,9 @@ pub fn combine_vss_wallets(
     // candidate count bounded by O(N²) in the worst case (in
     // practice: 1-2 distinct lo's, 1-2 distinct hi's, well below 10
     // candidates).
-    let mut distinct_los_set: std::collections::BTreeSet<&str> =
-        std::collections::BTreeSet::new();
+    let mut distinct_los_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut distinct_los: Vec<&str> = Vec::new();
-    let mut distinct_his_set: std::collections::BTreeSet<&str> =
-        std::collections::BTreeSet::new();
+    let mut distinct_his_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut distinct_his: Vec<&str> = Vec::new();
     for w in vss_wallets {
         if distinct_los_set.insert(w.verification_data.as_str()) {
@@ -1017,17 +1114,11 @@ pub fn combine_vss_wallets(
     candidates.sort_by(|a, b| {
         let a_count = vss_wallets
             .iter()
-            .filter(|w| {
-                w.verification_data == *a.0
-                    && w.verification_data_hi.as_deref() == a.1
-            })
+            .filter(|w| w.verification_data == *a.0 && w.verification_data_hi.as_deref() == a.1)
             .count();
         let b_count = vss_wallets
             .iter()
-            .filter(|w| {
-                w.verification_data == *b.0
-                    && w.verification_data_hi.as_deref() == b.1
-            })
+            .filter(|w| w.verification_data == *b.0 && w.verification_data_hi.as_deref() == b.1)
             .count();
         b_count.cmp(&a_count)
     });
@@ -1103,7 +1194,7 @@ pub fn combine_vss_wallets(
                         let Ok(bb) = hex::decode(&w.blinder_share_data) else {
                             return false;
                         };
-                        set.verify_share_and_blinder(&sb, &bb).is_ok()
+                        verify_vsss_share_pair(set, &sb, &bb)
                     };
                 let verifies_hi =
                     |w: &crate::wallet_description::VssJsonWalletDescriptionV0| -> bool {
@@ -1111,9 +1202,10 @@ pub fn combine_vss_wallets(
                             Some(s) => s,
                             None => return true, // 12-word: no hi half ⇒ vacuously OK
                         };
-                        let (Some(s), Some(b)) =
-                            (w.share_data_hi.as_deref(), w.blinder_share_data_hi.as_deref())
-                        else {
+                        let (Some(s), Some(b)) = (
+                            w.share_data_hi.as_deref(),
+                            w.blinder_share_data_hi.as_deref(),
+                        ) else {
                             return false;
                         };
                         let Ok(sb) = hex::decode(s) else {
@@ -1122,7 +1214,7 @@ pub fn combine_vss_wallets(
                         let Ok(bb) = hex::decode(b) else {
                             return false;
                         };
-                        set.verify_share_and_blinder(&sb, &bb).is_ok()
+                        verify_vsss_share_pair(set, &sb, &bb)
                     };
                 let verified_inputs: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
                     vss_wallets
@@ -1130,12 +1222,21 @@ pub fn combine_vss_wallets(
                         .copied()
                         .filter(|w| verifies_lo(w) && verifies_hi(w))
                         .collect();
-                if !verified_inputs.is_empty() {
+                let complete_verified_ids: std::collections::HashSet<VsssScalar> = verified_inputs
+                    .iter()
+                    .filter_map(|w| complete_vsss_share_identifier(w, hi_hex_opt.is_some()))
+                    .collect();
+                if complete_verified_ids.len() >= candidate_threshold as usize {
                     successes.push((
                         secret,
                         verified_inputs,
                         lo_hex.to_string(),
                         hi_hex_opt.map(|s| s.to_string()),
+                    ));
+                } else {
+                    last_err = Some(anyhow!(
+                        "Candidate recovered mnemonic but only {} complete verified share identifier(s) were present; threshold is {candidate_threshold}",
+                        complete_verified_ids.len()
                     ));
                 }
             }
@@ -1169,10 +1270,7 @@ pub fn combine_vss_wallets(
                 Ok(b) => b,
                 Err(_) => return false,
             };
-            if lo_set
-                .verify_share_and_blinder(&lo_bytes, &lo_blinder)
-                .is_err()
-            {
+            if !verify_vsss_share_pair(lo_set, &lo_bytes, &lo_blinder) {
                 return false;
             }
             if let Some(hi_set) = &verifier_hi {
@@ -1189,10 +1287,7 @@ pub fn combine_vss_wallets(
                     Ok(b) => b,
                     Err(_) => return false,
                 };
-                if hi_set
-                    .verify_share_and_blinder(&hi_bytes, &hi_blinder)
-                    .is_err()
-                {
+                if !verify_vsss_share_pair(hi_set, &hi_bytes, &hi_blinder) {
                     return false;
                 }
             }
@@ -1200,9 +1295,9 @@ pub fn combine_vss_wallets(
         };
         let verified: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
             group.iter().copied().filter(|w| share_passes(w)).collect();
-        // Dedupe by the **cryptographic** share identifier (first byte
-        // of decoded `share_data`) — NOT the mutable `share_index`
-        // JSON field. Within each id's bucket the share-data bytes
+        // Dedupe by the **cryptographic** typed share identifier — NOT
+        // the mutable `share_index` JSON field. Within each id's bucket
+        // the share-data bytes
         // are byte-identical (two shares with the same id that both
         // passed Pedersen verification are forced to coincide on the
         // polynomial), but the surrounding `original_wallet` metadata
@@ -1214,16 +1309,14 @@ pub fn combine_vss_wallets(
         // wins would let input order decide whose metadata propagates,
         // which on exact-threshold inputs can shift the strict-majority
         // outcome.
-        let mut by_id: std::collections::BTreeMap<
-            u8,
+        let mut by_id: std::collections::HashMap<
+            VsssScalar,
             Vec<&crate::wallet_description::VssJsonWalletDescriptionV0>,
-        > = std::collections::BTreeMap::new();
+        > = std::collections::HashMap::new();
         for w in &verified {
-            let crypto_id = hex::decode(&w.share_data)
-                .ok()
-                .and_then(|b| b.first().copied())
-                .unwrap_or(w.share_index);
-            by_id.entry(crypto_id).or_default().push(*w);
+            if let Ok(crypto_id) = vsss_share_identifier_from_hex(&w.share_data) {
+                by_id.entry(crypto_id).or_default().push(*w);
+            }
         }
         let deduped: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> = by_id
             .into_values()
@@ -1365,9 +1458,7 @@ pub fn combine_vss_wallets(
     //   * The reconstructed wallet's no-passphrase xpub doesn't match
     //     the metadata's `singlesig_xpub`.
     let authenticate = |recovery: VssRecovery| -> Result<VssRecovery> {
-        if recovery.metadata.singlesig_xpub.is_empty()
-            || recovery.metadata.network.is_empty()
-        {
+        if recovery.metadata.singlesig_xpub.is_empty() || recovery.metadata.network.is_empty() {
             bail!(
                 "Recovered mnemonic could not be authenticated: the per-group share \
                  metadata vote tied across all candidates, leaving no authoritative \
@@ -1378,12 +1469,10 @@ pub fn combine_vss_wallets(
         }
         let mut sanity_rng = rand::thread_rng();
         let sanity_secp = crate::random_generation_utils::get_secp(&mut sanity_rng);
-        recovery
-            .rebuild_singlesig(&None, &sanity_secp)
-            .context(
-                "Recovered mnemonic does not match the share metadata's xpub — the \
+        recovery.rebuild_singlesig(&None, &sanity_secp).context(
+            "Recovered mnemonic does not match the share metadata's xpub — the \
                  share set may have been tampered with",
-            )?;
+        )?;
         Ok(recovery)
     };
 
@@ -1435,10 +1524,9 @@ pub fn combine_vss_wallets(
                     .iter()
                     .map(|(_, group, lo, hi)| derive_metadata(group, lo, hi.as_deref()))
                     .collect();
-                let is_empty =
-                    |m: &crate::wallet_description::SinglesigPublicMetadataV0| -> bool {
-                        m.singlesig_xpub.is_empty() || m.network.is_empty()
-                    };
+                let is_empty = |m: &crate::wallet_description::SinglesigPublicMetadataV0| -> bool {
+                    m.singlesig_xpub.is_empty() || m.network.is_empty()
+                };
                 // Two compatibility checks that BOTH must pass for a
                 // collapse to be safe:
                 //   (1) The non-empty wallet-identity metadata
@@ -1627,6 +1715,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_verify_vsss_share_pair_rejects_mismatched_blinder_identifier() {
+        let mnemonic = Mnemonic::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let mut rng = rand::thread_rng();
+
+        let shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
+        let verifier_set = parse_ristretto_points(&shares[0].verification_data).unwrap();
+        let secret_bytes = hex::decode(&shares[0].share_data).unwrap();
+        let mut blinder_bytes = hex::decode(&shares[0].blinder_share_data).unwrap();
+        let other_blinder_bytes = hex::decode(&shares[1].blinder_share_data).unwrap();
+
+        assert!(verify_vsss_share_pair(
+            &verifier_set,
+            &secret_bytes,
+            &blinder_bytes
+        ));
+
+        // vsss-rs 5 shares are `identifier || value`. Keep the blinder
+        // value valid for share[0], but replace only its typed identifier
+        // with share[1]'s identifier. Pedersen verification evaluates at
+        // the secret share's identifier, so the helper must reject the
+        // pair before calling into vsss-rs.
+        blinder_bytes[..32].copy_from_slice(&other_blinder_bytes[..32]);
+        assert_ne!(&secret_bytes[..32], &blinder_bytes[..32]);
+        assert!(!verify_vsss_share_pair(
+            &verifier_set,
+            &secret_bytes,
+            &blinder_bytes
+        ));
+    }
+
     /// Property test: 100 random 24-word mnemonics must each round-trip
     /// through split + combine exactly.
     ///
@@ -1665,10 +1787,7 @@ mod tests {
             let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
             let shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
             let recovered = combine_shares_to_mnemonic(&shares[0..2]).unwrap();
-            assert_eq!(
-                recovered.expose_secret().to_string(),
-                mnemonic.to_string(),
-            );
+            assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string(),);
         }
     }
 
@@ -1697,10 +1816,11 @@ mod tests {
             &secp,
         )
         .unwrap();
-        let json = SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp)
-            .unwrap();
+        let json =
+            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
-        let vss_wallets = split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
+        let vss_wallets =
+            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
         assert_eq!(vss_wallets.len(), 3);
 
         // The serialized share must not contain the seed phrase or any xpriv —
@@ -1725,7 +1845,10 @@ mod tests {
         let rebuilt = vss_wallets[0]
             .to_singlesig(&recovered_phrase, &None, &secp)
             .unwrap();
-        assert_eq!(rebuilt.encoded_singlesig_xpub(), wallet.encoded_singlesig_xpub());
+        assert_eq!(
+            rebuilt.encoded_singlesig_xpub(),
+            wallet.encoded_singlesig_xpub()
+        );
     }
 
     /// The public `split_singlesig_wallet` API must refuse a wallet
@@ -1766,20 +1889,19 @@ mod tests {
             &secp,
         )
         .unwrap();
-        let json = SinglesigJsonWalletDescriptionV0::from_wallet_description(
-            &passphrase_wallet,
-            &secp,
-        )
-        .unwrap();
+        let json =
+            SinglesigJsonWalletDescriptionV0::from_wallet_description(&passphrase_wallet, &secp)
+                .unwrap();
 
         let err = match split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng) {
-            Ok(_) => panic!("expected split_singlesig_wallet to refuse a passphrase-derived wallet"),
+            Ok(_) => {
+                panic!("expected split_singlesig_wallet to refuse a passphrase-derived wallet")
+            }
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Refusing to split")
-                && msg.contains("no-passphrase"),
+            msg.contains("Refusing to split") && msg.contains("no-passphrase"),
             "expected refusal pointing at the no-passphrase invariant, got: {msg}"
         );
 
@@ -1805,10 +1927,12 @@ mod tests {
     /// "pre-pad size > minimum" would block the common case.
     #[test]
     fn test_vss_encrypt_succeeds_with_default_padding_for_24_word() {
-        use crate::random_generation_utils::{get_random_key, get_random_nonce, get_random_salt, get_secp};
+        use crate::random_generation_utils::{
+            get_random_key, get_random_nonce, get_random_salt, get_secp,
+        };
         use crate::wallet_description::{
-            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
-            EncryptedWalletVersion,
+            EncryptedWalletVersion, ScriptType, SingleSigWalletDescriptionV0,
+            SinglesigJsonWalletDescriptionV0,
         };
         use crate::{
             PaddingParams, generate_encrypted_encoded_vss_wallet, get_padder,
@@ -1820,8 +1944,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let secp = get_secp(&mut rng);
         // 24-word fixture (largest standard mnemonic).
-        let phrase =
-            "abandon abandon abandon abandon abandon abandon abandon abandon \
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon \
              abandon abandon abandon abandon abandon abandon abandon abandon \
              abandon abandon abandon abandon abandon abandon abandon art";
         let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
@@ -1843,7 +1966,8 @@ mod tests {
         let padding_params = PaddingParams::default();
         let padder = get_padder(&mut rng, &padding_params).unwrap();
         let password = Arc::new(secrecy::SecretString::from("test password".to_string()));
-        let key = default_derive_key(&password, &[], &salt, &KeyDerivationDifficulty::Easy).unwrap();
+        let key =
+            default_derive_key(&password, &[], &salt, &KeyDerivationDifficulty::Easy).unwrap();
         let header_key = SecretBox::from(Box::new(get_random_key(&mut rng).unwrap()));
 
         // The actual smoke test: encryption must succeed even when the
@@ -2051,8 +2175,7 @@ mod tests {
         let secp = get_secp(&mut rng);
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mut split = |is_duress: bool| {
-            let mnemonic =
-                SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
+            let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
             let wallet = SingleSigWalletDescriptionV0::generate(
                 Arc::new(mnemonic),
                 &None,
@@ -2061,14 +2184,18 @@ mod tests {
                 &secp,
             )
             .unwrap();
-            let json = SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp)
-                .unwrap();
+            let json =
+                SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
             split_singlesig_wallet(json.expose_secret(), 2, 3, is_duress, &mut rng).unwrap()
         };
 
         let normal = split(false);
         let duress = split(true);
-        let mixed: Vec<_> = normal.iter().cloned().chain(duress.iter().cloned()).collect();
+        let mixed: Vec<_> = normal
+            .iter()
+            .cloned()
+            .chain(duress.iter().cloned())
+            .collect();
 
         // Sanity-check: the two share sets do carry different is_duress flags.
         let normal_duress = match &normal[0].original_wallet {
@@ -2188,7 +2315,10 @@ mod tests {
         let real = recovered
             .rebuild_singlesig(&Some(Arc::clone(&passphrase)), &secp)
             .unwrap();
-        assert_ne!(real.encoded_singlesig_xpub(), decoy.encoded_singlesig_xpub());
+        assert_ne!(
+            real.encoded_singlesig_xpub(),
+            decoy.encoded_singlesig_xpub()
+        );
 
         // Per-share path refuses passphrases (defense in depth).
         let err = match vss[0].to_singlesig(
@@ -2232,14 +2362,15 @@ mod tests {
             &secp,
         )
         .unwrap();
-        let json = SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp)
-            .unwrap();
+        let json =
+            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
         let mut vss_wallets =
             split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
 
         // Construct an unrelated wallet to source a valid-looking but wrong xpub.
-        let other_phrase = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let other_phrase =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
         let other_mnemonic =
             SecretBox::new(Box::new(bip39::Mnemonic::from_str(other_phrase).unwrap()));
         let other_wallet = SingleSigWalletDescriptionV0::generate(
@@ -2298,8 +2429,7 @@ mod tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
         let mut split_same = || {
-            let mnemonic =
-                SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
+            let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
             let wallet = SingleSigWalletDescriptionV0::generate(
                 Arc::new(mnemonic),
                 &None,
@@ -2308,8 +2438,8 @@ mod tests {
                 &secp,
             )
             .unwrap();
-            let json = SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp)
-                .unwrap();
+            let json =
+                SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
             split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap()
         };
 
@@ -2348,7 +2478,8 @@ mod tests {
         let secp = get_secp(&mut rng);
 
         let phrase_a = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let phrase_b = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let phrase_b =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
         let mut make_wallets = |phrase: &str| {
             let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
@@ -2360,8 +2491,8 @@ mod tests {
                 &secp,
             )
             .unwrap();
-            let json = SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp)
-                .unwrap();
+            let json =
+                SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
             split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap()
         };
 
@@ -2497,18 +2628,76 @@ mod tests {
         // adds (good_lo_1, good_hi_0), which combines successfully.
         let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 2, false, &mut rng).unwrap();
         vss[0].verification_data = "deadbeef,deadbeef,deadbeef,deadbeef".to_string();
-        vss[1].verification_data_hi =
-            Some("cafebabe,cafebabe,cafebabe,cafebabe".to_string());
+        vss[1].verification_data_hi = Some("cafebabe,cafebabe,cafebabe,cafebabe".to_string());
 
         let recovered = combine_vss_wallets(&vss).unwrap();
         assert_eq!(recovered.mnemonic.expose_secret().to_string(), phrase);
+    }
+
+    /// A 24-word recovery must have threshold many complete share identities:
+    /// the low half and high half may each be independently recoverable, but
+    /// metadata is not authenticated unless the same threshold-sized set of
+    /// cryptographic share identifiers verifies for both halves.
+    #[test]
+    fn test_combine_vss_wallets_rejects_below_threshold_complete_share_ids() {
+        use crate::random_generation_utils::get_secp;
+        use crate::wallet_description::{
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
+        };
+        use std::str::FromStr;
+        use std::sync::Arc;
+
+        fn bump_share_value(hex_share: &mut String) {
+            let bytes = hex::decode(hex_share.as_str()).unwrap();
+            let share = vsss_share_from_bytes(&bytes).unwrap();
+            let value = IdentifierPrimeField(WrappedScalar(share.value().0.0 + Scalar::from(1u64)));
+            let tampered = VsssShare::with_identifier_and_value(*share.identifier(), value);
+            *hex_share = hex::encode(vsss_share_to_bytes(&tampered));
+        }
+
+        let mut rng = rand::thread_rng();
+        let secp = get_secp(&mut rng);
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+        let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
+        let wallet = SingleSigWalletDescriptionV0::generate(
+            Arc::new(mnemonic),
+            &None,
+            bitcoin::Network::Bitcoin,
+            ScriptType::SegwitNative,
+            &secp,
+        )
+        .unwrap();
+        let json =
+            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 3, 5, false, &mut rng).unwrap();
+
+        // Low half can still recover from ids {1,2,3}; high half can
+        // still recover from ids {3,4,5}. Their complete intersection is
+        // only id {3}, below threshold=3, so metadata must not be accepted.
+        for share in vss.iter_mut().skip(3) {
+            bump_share_value(&mut share.share_data);
+        }
+        for share in vss.iter_mut().take(2) {
+            bump_share_value(share.share_data_hi.as_mut().unwrap());
+        }
+
+        let err = match combine_vss_wallets(&vss) {
+            Ok(_) => panic!("expected below-threshold complete-share intersection to be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("complete verified share identifier")
+                || msg.contains("No threshold-compatible subset"),
+            "expected complete-share threshold rejection, got: {msg}"
+        );
     }
 
     /// Tamper the share_data hex of one share, then attempt to combine the
     /// threshold shares. Lagrange interpolation alone would happily produce
     /// *some* scalar (and thus *some* mnemonic) from any t consistent points,
     /// so without per-share verification a bad share would silently corrupt
-    /// recovery. With Feldman verification on the combine path, the tampered
+    /// recovery. With Pedersen verification on the combine path, the tampered
     /// share must be rejected before reconstruction.
     #[test]
     fn test_tampered_share_is_rejected() {
@@ -2517,12 +2706,12 @@ mod tests {
 
         let mut shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
 
-        // Flip a few hex nibbles in share 0's share_data so it still parses
-        // as hex but encodes a different field element. (We preserve the
-        // first byte, which encodes the share identifier.)
+        // Flip the value half of share 0's share_data so it still parses
+        // as hex but encodes a different field element. The first 32 bytes
+        // encode the vsss-rs 5 typed identifier, so leave them intact.
         let mut bytes = hex::decode(&shares[0].share_data).unwrap();
-        assert!(bytes.len() > 4);
-        for b in &mut bytes[1..] {
+        assert_eq!(bytes.len(), 64);
+        for b in &mut bytes[32..] {
             *b ^= 0xAA;
         }
         shares[0].share_data = hex::encode(&bytes);
@@ -2534,7 +2723,7 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Feldman")
+            msg.contains("Pedersen")
                 || msg.contains("verification")
                 || msg.contains("Insufficient verified shares"),
             "expected verification failure, got: {msg}"
@@ -2559,7 +2748,8 @@ mod tests {
         let secp = get_secp(&mut rng);
 
         let phrase_a = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let phrase_b = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let phrase_b =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
         let mut split = |phrase: &str| {
             let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
@@ -2577,13 +2767,13 @@ mod tests {
         };
 
         let mut set_a = split(phrase_a); // larger group, but two shares get corrupted
-        let set_b = split(phrase_b);     // smaller-presence-but-clean group
+        let set_b = split(phrase_b); // smaller-presence-but-clean group
 
         // Corrupt 2 of the 3 shares in set A so its verified count drops to
         // 1 (below threshold=2).
         for share in set_a.iter_mut().take(2) {
             let mut bytes = hex::decode(&share.share_data).unwrap();
-            for b in &mut bytes[1..] {
+            for b in &mut bytes[32..] {
                 *b ^= 0xAA;
             }
             share.share_data = hex::encode(&bytes);
@@ -2605,14 +2795,14 @@ mod tests {
     }
 
     /// Recovery must depend only on cryptographically authoritative data
-    /// (Feldman verifier set + share bytes). Tampering with the mutable
+    /// (Pedersen verifier set + share bytes). Tampering with the mutable
     /// `threshold` JSON field — either UP (e.g. claiming 5 instead of 2)
     /// or DOWN (claiming 2 instead of 3) — must not affect the outcome:
     ///   * "edit up": recovery still succeeds, because the real threshold
-    ///     comes from the Feldman set.
+    ///     comes from the Pedersen set.
     ///   * "edit down": cannot trick combine into using fewer points,
     ///     because Lagrange interpolation needs the real polynomial degree
-    ///     and per-share Feldman verification rejects forged points; in
+    ///     and per-share Pedersen verification rejects forged points; in
     ///     the all-genuine-shares case recovery again succeeds and the
     ///     downgraded metadata is harmless noise.
     #[test]
@@ -2641,7 +2831,8 @@ mod tests {
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
         for tampered_threshold in [1u8, 5u8, 99u8] {
-            let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
+            let mut vss =
+                split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
             for w in vss.iter_mut() {
                 w.threshold = tampered_threshold;
                 w.total_shares = 99; // also corrupt this — should be ignored
@@ -2658,7 +2849,7 @@ mod tests {
     /// Lower-level mirror of the above: at the `combine_shares_to_mnemonic`
     /// API, tampering the `Share.threshold` field on every share of a
     /// genuine 3-of-5 split (an attacker downgrading metadata to 2)
-    /// must NOT trick combine into accepting 2 shares — Lagrange + Feldman
+    /// must NOT trick combine into accepting 2 shares — Lagrange + Pedersen
     /// still demand the real polynomial. With 3 genuine shares supplied,
     /// recovery succeeds despite the lying metadata.
     #[test]
@@ -2672,7 +2863,7 @@ mod tests {
             share.checksum = share.compute_checksum();
         }
 
-        // 2 shares: must still fail because the Feldman threshold is 3.
+        // 2 shares: must still fail because the Pedersen threshold is 3.
         let err = combine_shares_to_mnemonic(&shares[0..2]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
@@ -2682,10 +2873,7 @@ mod tests {
 
         // 3 shares: recovery succeeds, downgraded metadata is harmless.
         let recovered = combine_shares_to_mnemonic(&shares[0..3]).unwrap();
-        assert_eq!(
-            recovered.expose_secret().to_string(),
-            mnemonic.to_string()
-        );
+        assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string());
     }
 
     /// An attacker who edits `mnemonic_length` from 24 down to 12 across
@@ -2738,10 +2926,7 @@ mod tests {
         shares[0].checksum = shares[0].compute_checksum();
 
         let recovered = combine_shares_to_mnemonic(&shares).unwrap();
-        assert_eq!(
-            recovered.expose_secret().to_string(),
-            mnemonic.to_string()
-        );
+        assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string());
     }
 
     /// A metadata-corrupted extra share must not strand a recoverable
@@ -2762,10 +2947,7 @@ mod tests {
         shares[2].version = 9999;
 
         let recovered = combine_shares_to_mnemonic(&shares).unwrap();
-        assert_eq!(
-            recovered.expose_secret().to_string(),
-            mnemonic.to_string()
-        );
+        assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string());
     }
 
     /// Share files must not embed Feldman commitments (`g^a_i`). For our
@@ -2795,7 +2977,11 @@ mod tests {
         // points (g, h, C_0, C_1). Anything else means we accidentally
         // serialized the wrong commitment set.
         let parts: Vec<&str> = shares[0].verification_data.split(',').collect();
-        assert_eq!(parts.len(), 4, "verification_data must be 4 points for 2-of-3 split: {parts:?}");
+        assert_eq!(
+            parts.len(),
+            4,
+            "verification_data must be 4 points for 2-of-3 split: {parts:?}"
+        );
     }
 
     /// One corrupted share among extra redundant shares must not block
@@ -2810,16 +2996,13 @@ mod tests {
         // should drop the bad one, keep shares 1 and 2, and recover the seed.
         let mut shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
         let mut bytes = hex::decode(&shares[0].share_data).unwrap();
-        for b in &mut bytes[1..] {
+        for b in &mut bytes[32..] {
             *b ^= 0xAA;
         }
         shares[0].share_data = hex::encode(&bytes);
         shares[0].checksum = shares[0].compute_checksum();
 
         let recovered = combine_shares_to_mnemonic(&shares).unwrap();
-        assert_eq!(
-            recovered.expose_secret().to_string(),
-            mnemonic.to_string()
-        );
+        assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string());
     }
 }

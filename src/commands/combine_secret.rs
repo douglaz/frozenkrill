@@ -45,9 +45,7 @@ pub(crate) fn combine_shares(
     let password = match password {
         Some(p) => Arc::new(p),
         None => {
-            println!(
-                "\nTo decrypt the shares, please provide the password used during splitting"
-            );
+            println!("\nTo decrypt the shares, please provide the password used during splitting");
             println!(
                 "(leave blank if the shares were created with no password, e.g. keyfile-only):"
             );

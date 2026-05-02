@@ -618,8 +618,8 @@ struct CombineSecretArgs {
     /// bind a clap `env` here so an explicit `--password ...` cleanly
     /// overrides any environment variables on the same invocation.
     /// Env-based fallback is handled at the call site, in this
-    /// priority: explicit --password > FROZENKRILL_SHARE_PASSWORD env
-    /// > interactive prompt. The generic PASSWORD env (used by other
+    /// priority: explicit --password, then FROZENKRILL_SHARE_PASSWORD env,
+    /// then interactive prompt. The generic PASSWORD env (used by other
     /// wallet-open commands) is intentionally NOT consulted here —
     /// shares carry their own credentials (see `--share-password`)
     /// that may legitimately differ from the source wallet's
@@ -998,8 +998,7 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             // secrets. The downstream open path would error eventually
             // either way, but only after `ask_password` (and, in
             // duress mode, the BIP-39 passphrase prompt) had run.
-            let preflight_wallet_input =
-                std::path::Path::new(&args.common.wallet_input_file);
+            let preflight_wallet_input = std::path::Path::new(&args.common.wallet_input_file);
             anyhow::ensure!(
                 preflight_wallet_input.exists(),
                 "Source wallet file does not exist: {}",
@@ -1089,7 +1088,9 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 Some(p) => Arc::new(SecretString::new(p.into())),
                 None => {
                     let typed = dialoguer::Password::with_theme(theme.as_ref())
-                        .with_prompt("Source wallet password (leave blank for keyfile-only wallets)")
+                        .with_prompt(
+                            "Source wallet password (leave blank for keyfile-only wallets)",
+                        )
                         .allow_empty_password(true)
                         .interact_on(term)
                         .context("failure reading source wallet password")?;
@@ -1193,10 +1194,8 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 // deniability), so visual confirmation against the
                 // user's own knowledge of their funded address is the
                 // only check available.
-                let candidate_real = wallet.change_seed_password(
-                    &Some(Arc::clone(non_duress_password)),
-                    &secp,
-                )?;
+                let candidate_real =
+                    wallet.change_seed_password(&Some(Arc::clone(non_duress_password)), &secp)?;
                 let candidate_first_address =
                     candidate_real.first_receiving_address(&secp)?.to_string();
                 println!("\n⚠️  CONFIRM HIDDEN-WALLET ADDRESS");
@@ -1212,9 +1211,7 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 println!("wrong and these shares would silently strand those funds.");
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
                 let confirmed = Confirm::with_theme(theme.as_ref())
-                    .with_prompt(
-                        "Is this the hidden wallet you want to back up with these shares?",
-                    )
+                    .with_prompt("Is this the hidden wallet you want to back up with these shares?")
                     .default(false)
                     .interact_on(term)?;
                 if !confirmed {
@@ -1489,9 +1486,7 @@ fn ask_optional_non_duress_password(
     term: &Term,
 ) -> anyhow::Result<Option<Arc<SecretString>>> {
     let typed = dialoguer::Password::with_theme(theme)
-        .with_prompt(
-            "Enter the non-duress BIP-39 passphrase (leave blank if the wallet has none)",
-        )
+        .with_prompt("Enter the non-duress BIP-39 passphrase (leave blank if the wallet has none)")
         .allow_empty_password(true)
         .with_confirmation("Confirm passphrase", "Passphrases don't match, try again")
         .interact_on(term)

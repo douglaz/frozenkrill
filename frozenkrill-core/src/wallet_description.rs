@@ -1308,10 +1308,7 @@ pub struct SinglesigPublicMetadataV0 {
 impl SinglesigPublicMetadataV0 {
     /// Project a full singlesig wallet json into the public-only metadata that
     /// gets embedded in each share.
-    pub fn from_singlesig_json(
-        w: &SinglesigJsonWalletDescriptionV0,
-        is_duress: bool,
-    ) -> Self {
+    pub fn from_singlesig_json(w: &SinglesigJsonWalletDescriptionV0, is_duress: bool) -> Self {
         Self {
             version: w.version,
             sigtype: w.sigtype.clone(),
@@ -1321,9 +1318,7 @@ impl SinglesigPublicMetadataV0 {
             multisig_xpub: w.multisig_xpub.clone(),
             multisig_derivation_path: w.multisig_derivation_path.clone(),
             singlesig_first_address: w.singlesig_first_address.clone(),
-            singlesig_receiving_output_descriptor: w
-                .singlesig_receiving_output_descriptor
-                .clone(),
+            singlesig_receiving_output_descriptor: w.singlesig_receiving_output_descriptor.clone(),
             singlesig_change_output_descriptor: w.singlesig_change_output_descriptor.clone(),
             network: w.network.to_string(),
             script_type: w.script_type.to_string(),
@@ -1483,7 +1478,10 @@ impl VssJsonWalletDescriptionV0 {
         let network = Network::from_str(&metadata.network)
             .with_context(|| format!("invalid network in share metadata: {}", metadata.network))?;
         let script_type = ScriptType::from_str(&metadata.script_type).with_context(|| {
-            format!("invalid script type in share metadata: {}", metadata.script_type)
+            format!(
+                "invalid script type in share metadata: {}",
+                metadata.script_type
+            )
         })?;
 
         // Authenticate the share metadata BEFORE returning anything.
