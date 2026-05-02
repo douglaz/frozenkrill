@@ -2,12 +2,14 @@
 //!
 //! See `docs/secret_sharing.md` for the user-facing model and security notes.
 
+use crate::wallet_description::{
+    SinglesigPublicMetadataV0, VssJsonWalletDescriptionV0, ZERO_VSS_WALLET_VERSION,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use bip39::Mnemonic;
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar;
 use secrecy::{ExposeSecret, SecretBox};
-use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use vsss_rs::curve25519::{WrappedRistretto, WrappedScalar};
 use vsss_rs::pedersen::{StdPedersenResult, split_secret};
@@ -26,7 +28,7 @@ type VsssVerifier = ValueGroup<WrappedRistretto>;
 /// mode — you also need the BIP-39 passphrase to recover the real wallet").
 pub struct VssRecovery {
     pub mnemonic: SecretBox<Mnemonic>,
-    pub metadata: crate::wallet_description::SinglesigPublicMetadataV0,
+    pub metadata: SinglesigPublicMetadataV0,
 }
 
 impl VssRecovery {
@@ -118,7 +120,7 @@ impl VssRecovery {
         )
     }
 }
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 /// Error types for secret sharing operations
 #[derive(Debug, thiserror::Error)]
@@ -149,57 +151,6 @@ pub enum SecretSharingError {
 
     #[error("Share file format error: {0}")]
     FileFormatError(String),
-}
-
-/// Internal share representation. The public on-disk format is the
-/// AEAD-authenticated `VssJsonWalletDescriptionV0`; bare `Share`s are only for
-/// split/combine internals and tests.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-pub(crate) struct Share {
-    /// Schema version for future compatibility
-    pub version: u32,
-
-    /// Secret sharing scheme used (always "pedersen" for this implementation)
-    pub scheme: String,
-
-    /// This share's index (1-based)
-    pub share_index: u8,
-
-    /// Minimum number of shares needed to reconstruct (M in M-of-N)
-    pub threshold: u8,
-
-    /// Total number of shares created (N in M-of-N)
-    pub total_shares: u8,
-
-    /// Original mnemonic word count (12 or 24)
-    pub mnemonic_length: usize,
-
-    /// Secret share of the low 16 entropy bytes (hex-encoded).
-    pub share_data: String,
-
-    /// Blinder share of the low 16 entropy bytes (hex-encoded). Required to
-    /// verify `share_data` against the Pedersen commitments without
-    /// learning anything about the secret.
-    pub blinder_share_data: String,
-
-    /// Pedersen commitments for the low half (hex-encoded, comma-separated).
-    /// Layout: `[g, h, C_0, C_1, ..., C_{t-1}]` where `C_i = g^a_i * h^b_i`.
-    pub verification_data: String,
-
-    /// Secret share of the high 16 entropy bytes (hex-encoded). Present iff 24-word.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub share_data_hi: Option<String>,
-
-    /// Blinder share of the high 16 entropy bytes. Present iff 24-word.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blinder_share_data_hi: Option<String>,
-
-    /// Pedersen commitments for the high half. Present iff 24-word.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_data_hi: Option<String>,
-
-    /// ISO 8601 timestamp of share creation
-    pub created_at: String,
 }
 
 /// Pack a 16-byte entropy half into a Curve25519 scalar.
@@ -250,7 +201,7 @@ fn vsss_share_identifier_from_hex(hex_str: &str) -> Result<VsssScalar> {
 }
 
 fn complete_vsss_share_identifier(
-    wallet: &crate::wallet_description::VssJsonWalletDescriptionV0,
+    wallet: &VssJsonWalletDescriptionV0,
     has_hi: bool,
 ) -> Option<VsssScalar> {
     let lo_id = vsss_share_identifier_from_hex(&wallet.share_data).ok()?;
@@ -283,7 +234,7 @@ fn verify_vsss_share_pair(
 }
 
 fn wallet_verifies_against_candidate(
-    wallet: &crate::wallet_description::VssJsonWalletDescriptionV0,
+    wallet: &VssJsonWalletDescriptionV0,
     lo_set: &Vec<VsssVerifier>,
     hi_set: Option<&Vec<VsssVerifier>>,
 ) -> bool {
@@ -344,7 +295,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     threshold: u8,
     total_shares: u8,
     rng: &mut R,
-) -> Result<Vec<Share>> {
+) -> Result<Vec<VssJsonWalletDescriptionV0>> {
     if threshold < 2 || total_shares < 2 {
         bail!(SecretSharingError::InvalidShareCount);
     }
@@ -360,6 +311,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     if word_count != 12 && word_count != 24 {
         bail!(SecretSharingError::InvalidMnemonicLength);
     }
+    let mnemonic_length = u8::try_from(word_count).context("mnemonic length does not fit in u8")?;
 
     // Keep the raw BIP-39 entropy in zeroizing storage while splitting.
     let entropy = SecretBox::new(Box::new(mnemonic.to_entropy()));
@@ -389,13 +341,12 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
             .map(|h| hex::encode(&h.blinder_bytes[idx]));
         let verification_data_hi = hi_split.as_ref().map(|h| h.verification_data.clone());
 
-        shares.push(Share {
-            version: 1,
-            scheme: "pedersen".to_string(),
+        shares.push(VssJsonWalletDescriptionV0 {
+            version: ZERO_VSS_WALLET_VERSION,
             share_index: (idx + 1) as u8,
             threshold,
             total_shares,
-            mnemonic_length: word_count,
+            mnemonic_length,
             share_data,
             blinder_share_data,
             verification_data: lo_split.verification_data.clone(),
@@ -403,6 +354,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
             blinder_share_data_hi,
             verification_data_hi,
             created_at: timestamp.clone(),
+            original_wallet: SinglesigPublicMetadataV0::default(),
         });
     }
 
@@ -550,9 +502,11 @@ fn verified_unique_share_pairs(
     Ok(out)
 }
 
-/// Combine `Share`s to reconstruct the original mnemonic.
+/// Combine VSS share payloads to reconstruct the original mnemonic.
 #[cfg(test)]
-pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<Mnemonic>> {
+pub(crate) fn combine_shares_to_mnemonic(
+    shares: &[VssJsonWalletDescriptionV0],
+) -> Result<SecretBox<Mnemonic>> {
     if shares.is_empty() {
         bail!(anyhow!("No shares provided"));
     }
@@ -560,7 +514,7 @@ pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<M
     // Group by Pedersen verifier identity; input order must not choose the
     // canonical share when verifier-copy corruption is present.
     type GroupKey<'a> = (&'a str, Option<&'a str>);
-    let mut groups: std::collections::BTreeMap<GroupKey, Vec<&Share>> =
+    let mut groups: std::collections::BTreeMap<GroupKey, Vec<&VssJsonWalletDescriptionV0>> =
         std::collections::BTreeMap::new();
     for s in shares {
         let key: GroupKey = (
@@ -570,19 +524,12 @@ pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<M
         groups.entry(key).or_default().push(s);
     }
     // Try the largest verifier group first; verification still decides safety.
-    let chosen: Vec<&Share> = groups
+    let chosen: Vec<&VssJsonWalletDescriptionV0> = groups
         .into_values()
         .max_by_key(|g| g.len())
         .expect("non-empty input ⇒ at least one group");
     let first = chosen[0];
-
-    // Derive 12-vs-24 from the verifier set, not mutable JSON metadata.
-    let has_hi = first.verification_data_hi.is_some();
-    let derived_word_count: usize = if has_hi { 24 } else { 12 };
-
-    // Derive threshold from commitments; `Share.threshold` is advisory.
     let lo_threshold = threshold_from_pedersen(&first.verification_data)?;
-
     if chosen.len() < lo_threshold as usize {
         bail!(SecretSharingError::InsufficientShares {
             threshold: lo_threshold,
@@ -590,43 +537,19 @@ pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<M
         });
     }
 
-    let lo_scalar = combine_one_half(
+    let mnemonic = combine_wallet_candidate_to_mnemonic(
         &chosen,
-        |s| Some(s.share_data.as_str()),
-        |s| Some(s.blinder_share_data.as_str()),
         &first.verification_data,
+        first.verification_data_hi.as_deref(),
         lo_threshold,
-    )?
-    .ok_or_else(|| anyhow!("missing low-half share data"))?;
-    let lo_bytes = scalar_to_entropy_half(&lo_scalar);
-
-    let hi_bytes = if has_hi {
-        let hi_pedersen = first
-            .verification_data_hi
-            .as_deref()
-            .expect("checked .is_some() above");
-        let hi_threshold = threshold_from_pedersen(hi_pedersen)?;
-        anyhow::ensure!(
-            hi_threshold == lo_threshold,
-            "Low-half and high-half Pedersen verifier sets imply different thresholds ({lo_threshold} vs {hi_threshold})"
-        );
-        let hi_scalar = combine_one_half(
-            &chosen,
-            |s| s.share_data_hi.as_deref(),
-            |s| s.blinder_share_data_hi.as_deref(),
-            hi_pedersen,
-            hi_threshold,
-        )?
-        .ok_or_else(|| anyhow!("missing high-half share data"))?;
-        Some(scalar_to_entropy_half(&hi_scalar))
-    } else {
-        None
-    };
-
-    let mnemonic = entropy_to_mnemonic(&lo_bytes, hi_bytes.as_ref(), derived_word_count)?;
-
+    )?;
     // Advisory only: recovery already used the verifier-derived length.
-    if first.mnemonic_length != derived_word_count {
+    let derived_word_count = if first.verification_data_hi.is_some() {
+        24
+    } else {
+        12
+    };
+    if usize::from(first.mnemonic_length) != derived_word_count {
         log::warn!(
             "Share metadata says mnemonic_length={} but Pedersen verifier set implies {}; \
              metadata may have been tampered with — recovered using the verifier-derived length",
@@ -687,7 +610,7 @@ fn combine_one_half<T>(
 }
 
 fn combine_wallet_candidate_to_mnemonic(
-    wallets: &[&crate::wallet_description::VssJsonWalletDescriptionV0],
+    wallets: &[&VssJsonWalletDescriptionV0],
     lo_pedersen: &str,
     hi_pedersen: Option<&str>,
     threshold: u8,
@@ -735,7 +658,7 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     total_shares: u8,
     is_duress: bool,
     rng: &mut R,
-) -> Result<Vec<crate::wallet_description::VssJsonWalletDescriptionV0>> {
+) -> Result<Vec<VssJsonWalletDescriptionV0>> {
     use std::sync::Arc;
 
     let mnemonic =
@@ -774,62 +697,29 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
         );
     }
 
-    let shares = split_mnemonic(&mnemonic, threshold, total_shares, rng)?;
-
+    let mut shares = split_mnemonic(&mnemonic, threshold, total_shares, rng)?;
     // The VSS wrapper carries public metadata only; seed phrase and xprivs stay out.
-    let mut vss_wallets = Vec::with_capacity(shares.len());
-    for share in &shares {
-        let mnemonic_length =
-            u8::try_from(share.mnemonic_length).context("mnemonic length does not fit in u8")?;
-        let vss_wallet = crate::wallet_description::VssJsonWalletDescriptionV0::from_singlesig(
-            wallet,
-            share.share_index,
-            share.threshold,
-            share.total_shares,
-            mnemonic_length,
-            share.share_data.clone(),
-            share.blinder_share_data.clone(),
-            share.verification_data.clone(),
-            share.share_data_hi.clone(),
-            share.blinder_share_data_hi.clone(),
-            share.verification_data_hi.clone(),
-            is_duress,
-        );
-        vss_wallets.push(vss_wallet);
+    let metadata = SinglesigPublicMetadataV0::from_singlesig_json(wallet, is_duress);
+    for share in &mut shares {
+        share.original_wallet = metadata.clone();
     }
-    drop(shares);
-
-    Ok(vss_wallets)
+    Ok(shares)
 }
 
 /// Combine VSS wallet shares into a mnemonic plus authenticated public metadata.
-pub fn combine_vss_wallets(
-    vss_wallets: &[crate::wallet_description::VssJsonWalletDescriptionV0],
-) -> Result<VssRecovery> {
+pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result<VssRecovery> {
     if vss_wallets.is_empty() {
         bail!(anyhow!("No VSS wallets provided"));
     }
 
     // Do not prefilter mutable JSON metadata; Pedersen verification
     // decides which secret bytes belong to the candidate.
-    let vss_wallets_owned: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
-        vss_wallets.iter().collect();
-    let vss_wallets: &[&crate::wallet_description::VssJsonWalletDescriptionV0] = &vss_wallets_owned;
+    let vss_wallets_owned: Vec<&VssJsonWalletDescriptionV0> = vss_wallets.iter().collect();
+    let vss_wallets: &[&VssJsonWalletDescriptionV0] = &vss_wallets_owned;
 
     type CandidateVerifier<'a> = (&'a str, Option<&'a str>);
-    // Enumerate the *cross product* of distinct lo verifiers and
-    // distinct hi verifiers (plus `None` for hi, which models a
-    // 12-word backup). For 24-word exact-threshold recoveries where
-    // verifier-copy corruption independently hit the lo half on one
-    // share and the hi half on another share, the correct lo and hi
-    // verifiers both still exist in the input but never coexist on a
-    // single share — so an "only try (lo, hi) pairs as carried by
-    // some share" enumeration would miss the recoverable
-    // (good_lo_from_share_B, good_hi_from_share_A) combination.
-    // Cross-product enumeration covers that case while keeping the
-    // candidate count bounded by O(N²) in the worst case (in
-    // practice: 1-2 distinct lo's, 1-2 distinct hi's, well below 10
-    // candidates).
+    // Cross-product enumeration tolerates independent lo/hi verifier-copy
+    // corruption while keeping the candidate count bounded by O(N²).
     let mut distinct_los_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut distinct_los: Vec<&str> = Vec::new();
     let mut distinct_his_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -848,10 +738,7 @@ pub fn combine_vss_wallets(
         std::collections::BTreeSet::new();
     let mut candidates: Vec<CandidateVerifier> = Vec::new();
     for lo in &distinct_los {
-        // (lo, None) candidate — used by 12-word backups, and pruned
-        // below by the `los_with_hi` retain rule when we see a 24-word
-        // companion for the same lo (so a hybrid-attack can't
-        // downgrade a 24-word recovery to a 12-word one).
+        // Pruned below when a hi companion exists for the same lo verifier.
         let key: CandidateVerifier = (lo, None);
         if seen_candidates.insert(key) {
             candidates.push(key);
@@ -863,16 +750,8 @@ pub fn combine_vss_wallets(
             }
         }
     }
-    // For each lo verifier, drop the bogus `(lo, None)` candidate when
-    // ANY input share carries a hi half for that same lo. The
-    // strictness is asymmetric on purpose: returning a wrong 12-word
-    // mnemonic from a hi-stripped 24-word split (which would happen
-    // at exact-threshold when only the lo-only candidate succeeds)
-    // is a much worse failure mode than refusing to recover a real
-    // 12-word backup that has a single forged-hi share added — in
-    // the latter case the user gets a clear error and can re-run
-    // after removing the corrupted share. We choose fail-closed
-    // against the seed-corruption attack.
+    // Drop `(lo, None)` when any share carries a hi half for that lo; this
+    // fails closed against hi-stripped 24-word recoveries.
     let los_with_hi: std::collections::BTreeSet<&str> = vss_wallets
         .iter()
         .filter_map(|w| {
@@ -882,9 +761,7 @@ pub fn combine_vss_wallets(
         })
         .collect();
     candidates.retain(|(lo, hi)| !(hi.is_none() && los_with_hi.contains(lo)));
-    // Try larger / more-recent verifiers first — purely to keep error
-    // messages and side effects deterministic; the ambiguity check
-    // below is what actually decides safety.
+    // Deterministic ordering only; ambiguity checks decide safety.
     candidates.sort_by(|a, b| {
         let a_count = vss_wallets
             .iter()
@@ -897,13 +774,7 @@ pub fn combine_vss_wallets(
         b_count.cmp(&a_count)
     });
 
-    // (mnemonic, verified_inputs, lo_verifier_hex, hi_verifier_hex)
-    type SuccessEntry<'a> = (
-        SecretBox<Mnemonic>,
-        Vec<&'a crate::wallet_description::VssJsonWalletDescriptionV0>,
-        String,
-        Option<String>,
-    );
+    type SuccessEntry = (SecretBox<Mnemonic>, Vec<VssJsonWalletDescriptionV0>);
     let mut successes: Vec<SuccessEntry> = Vec::new();
     let mut last_err: Option<anyhow::Error> = None;
     let mut tried = 0usize;
@@ -930,26 +801,26 @@ pub fn combine_vss_wallets(
             Ok(secret) => {
                 let lo_set = parse_ristretto_points(lo_hex).ok();
                 let hi_set = hi_hex_opt.and_then(|h| parse_ristretto_points(h).ok());
-                let verified_inputs: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
-                    vss_wallets
-                        .iter()
-                        .copied()
-                        .filter(|w| match &lo_set {
-                            Some(lo) => wallet_verifies_against_candidate(w, lo, hi_set.as_ref()),
-                            None => false,
-                        })
-                        .collect();
+                let verified_inputs: Vec<VssJsonWalletDescriptionV0> = vss_wallets
+                    .iter()
+                    .copied()
+                    .filter(|w| match &lo_set {
+                        Some(lo) => wallet_verifies_against_candidate(w, lo, hi_set.as_ref()),
+                        None => false,
+                    })
+                    .map(|w| {
+                        let mut w = w.clone();
+                        w.verification_data = lo_hex.to_string();
+                        w.verification_data_hi = hi_hex_opt.map(str::to_string);
+                        w
+                    })
+                    .collect();
                 let complete_verified_ids: std::collections::HashSet<VsssScalar> = verified_inputs
                     .iter()
                     .filter_map(|w| complete_vsss_share_identifier(w, hi_hex_opt.is_some()))
                     .collect();
                 if complete_verified_ids.len() >= candidate_threshold as usize {
-                    successes.push((
-                        secret,
-                        verified_inputs,
-                        lo_hex.to_string(),
-                        hi_hex_opt.map(|s| s.to_string()),
-                    ));
+                    successes.push((secret, verified_inputs));
                 } else {
                     last_err = Some(anyhow!(
                         "Candidate recovered mnemonic but only {} complete verified share identifier(s) were present; threshold is {candidate_threshold}",
@@ -961,51 +832,21 @@ pub fn combine_vss_wallets(
         }
     }
 
-    // Compute the public metadata that should be exposed for a given
-    // candidate group. Pulled out so that the collapse path below can
-    // peek at each group's metadata without consuming `successes`.
-    let derive_metadata = |group: &[&crate::wallet_description::VssJsonWalletDescriptionV0],
-                           lo_pedersen: &str,
-                           hi_pedersen: Option<&str>|
-     -> crate::wallet_description::SinglesigPublicMetadataV0 {
-        // Use the *winning* verifier (the one that produced this
-        // candidate's successful recovery) — NOT `group[0].verification_data`,
-        // because the first share in the verified group might be the
-        // one whose verifier copy was corrupted.
-        let verifier_lo = parse_ristretto_points(lo_pedersen).ok();
-        let verifier_hi = hi_pedersen.and_then(|hex| parse_ristretto_points(hex).ok());
-        let verified: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> = group
-            .iter()
-            .copied()
-            .filter(|w| match &verifier_lo {
-                Some(lo) => wallet_verifies_against_candidate(w, lo, verifier_hi.as_ref()),
-                None => false,
-            })
-            .collect();
-        // Dedupe by the **cryptographic** typed share identifier — NOT
-        // the mutable `share_index` JSON field. Within each id's bucket
-        // the share-data bytes
-        // are byte-identical (two shares with the same id that both
-        // passed Pedersen verification are forced to coincide on the
-        // polynomial), but the surrounding `original_wallet` metadata
-        // can differ if the same share file was supplied multiple
-        // times with different metadata copies. We therefore group
-        // first, and only count the share's metadata vote if EVERY
-        // copy of that id agrees on the metadata. Otherwise the
-        // share's metadata is "indeterminate" and we abstain — first-
-        // wins would let input order decide whose metadata propagates,
-        // which on exact-threshold inputs can shift the strict-majority
-        // outcome.
-        let mut by_id: std::collections::HashMap<
-            VsssScalar,
-            Vec<&crate::wallet_description::VssJsonWalletDescriptionV0>,
-        > = std::collections::HashMap::new();
-        for w in &verified {
+    // Compute public metadata for a normalized, Pedersen-verified group.
+    let derive_metadata = |group: &[VssJsonWalletDescriptionV0]| -> SinglesigPublicMetadataV0 {
+        if group.is_empty() {
+            return SinglesigPublicMetadataV0::default();
+        }
+        // Dedupe by cryptographic share id. Duplicate copies only vote when
+        // all metadata copies for that id agree.
+        let mut by_id: std::collections::HashMap<VsssScalar, Vec<&VssJsonWalletDescriptionV0>> =
+            std::collections::HashMap::new();
+        for w in group {
             if let Ok(crypto_id) = vsss_share_identifier_from_hex(&w.share_data) {
-                by_id.entry(crypto_id).or_default().push(*w);
+                by_id.entry(crypto_id).or_default().push(w);
             }
         }
-        let deduped: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> = by_id
+        let deduped: Vec<&VssJsonWalletDescriptionV0> = by_id
             .into_values()
             .filter_map(|copies| {
                 let first_meta = &copies[0].original_wallet;
@@ -1016,34 +857,19 @@ pub fn combine_vss_wallets(
                 }
             })
             .collect();
-        // If every cryptographic share id had conflicting metadata
-        // copies (so `deduped` is empty), abstain entirely — falling
-        // back to `group` would re-count the duplicates and let extra
-        // forged copies manufacture a strict majority of bogus
-        // metadata. Returning the default empty metadata is the
-        // fail-closed answer: the seed itself still recovers, but no
-        // metadata is propagated.
+        // If every id conflicted, abstain rather than letting duplicate
+        // metadata copies manufacture a strict majority.
         if deduped.is_empty() {
-            return crate::wallet_description::SinglesigPublicMetadataV0::default();
+            return SinglesigPublicMetadataV0::default();
         }
-        let tally_source: &[&crate::wallet_description::VssJsonWalletDescriptionV0] = &deduped;
-        // Exclude `is_duress` from the metadata vote; it is aggregated
-        // separately below. Otherwise a
-        // single-bit `is_duress` flip on one share would tie the vote
-        // (1 vs 1 in exact-threshold recovery), the strict-majority
-        // guard would fall back to default metadata, and
-        // `VssRecovery::rebuild_singlesig` would then fail on the
-        // empty `network` / `script_type` even though the rest of the
-        // metadata is intact.
-        let canonicalize_duress =
-            |m: &crate::wallet_description::SinglesigPublicMetadataV0|
-             -> crate::wallet_description::SinglesigPublicMetadataV0 {
-                let mut m_copy = m.clone();
-                m_copy.is_duress = false;
-                m_copy
-            };
-        let mut counts: Vec<(usize, crate::wallet_description::SinglesigPublicMetadataV0)> =
-            Vec::new();
+        let tally_source: &[&VssJsonWalletDescriptionV0] = &deduped;
+        // Exclude `is_duress` from the identity vote; aggregate it separately.
+        let canonicalize_duress = |m: &SinglesigPublicMetadataV0| -> SinglesigPublicMetadataV0 {
+            let mut m_copy = m.clone();
+            m_copy.is_duress = false;
+            m_copy
+        };
+        let mut counts: Vec<(usize, SinglesigPublicMetadataV0)> = Vec::new();
         for w in tally_source {
             let key = canonicalize_duress(&w.original_wallet);
             if let Some(entry) = counts.iter_mut().find(|e| e.1 == key) {
@@ -1052,33 +878,12 @@ pub fn combine_vss_wallets(
                 counts.push((1, key));
             }
         }
-        // Require a *strict* majority: the top metadata variant must
-        // have more than half of the deduped, verified votes. On a tie
-        // (e.g. exact-threshold recovery with one tampered share)
-        // there is no authoritative answer, so we return the empty
-        // default metadata rather than picking the first variant in
-        // input order — that way callers using `xpub` / `network` /
-        // `script_type` to identify the wallet see blank fields and
-        // know not to trust them, while mnemonic recovery itself
-        // still proceeds.
-        //
-        // `is_duress` is aggregated separately (strict majority over
-        // verified shares) so the warning is still surfaced reliably
-        // when the rest of the metadata vote ties.
+        // Identity metadata requires a strict majority; ties abstain.
         let total_votes: usize = counts.iter().map(|(c, _)| *c).sum();
         let top_count = counts.iter().map(|(c, _)| *c).max().unwrap_or(0);
         let top_groups = counts.iter().filter(|(c, _)| *c == top_count).count();
-        // Aggregate `is_duress` by *strict majority* over the deduped
-        // verified set. Any-share-says-so used to be the rule, but a
-        // single tampered share with `is_duress=true` would then
-        // authorize a passphrase restore via
-        // `VssRecovery::rebuild_singlesig(Some(_))` and silently
-        // return whatever wallet that passphrase derives. Strict
-        // majority is the safer direction — a single tampered share
-        // can at worst suppress a real duress flag, which forces the
-        // user to recover the decoy view first (annoying but
-        // non-destructive) instead of fabricating a duress flag that
-        // hands an attacker-controlled wallet to the user.
+        // `is_duress` also uses strict majority so one tampered share cannot
+        // authorize a passphrase restore.
         let duress_yes = tally_source
             .iter()
             .filter(|w| w.original_wallet.is_duress)
@@ -1099,7 +904,7 @@ pub fn combine_vss_wallets(
                  no strict majority — returning empty metadata so callers don't trust an \
                  attacker-controlled xpub/network/script_type"
             );
-            crate::wallet_description::SinglesigPublicMetadataV0::default()
+            SinglesigPublicMetadataV0::default()
         };
         metadata.is_duress = any_duress;
         metadata
@@ -1107,29 +912,14 @@ pub fn combine_vss_wallets(
 
     let to_recovery = |successes: &mut Vec<SuccessEntry>| -> VssRecovery {
         let chosen = successes.pop().expect("non-empty successes");
-        let metadata = derive_metadata(&chosen.1, &chosen.2, chosen.3.as_deref());
+        let metadata = derive_metadata(&chosen.1);
         VssRecovery {
             mnemonic: chosen.0,
             metadata,
         }
     };
 
-    // Final authentication step: ensure the recovered mnemonic actually
-    // belongs to the wallet described by the recovered metadata. This
-    // turns combine_vss_wallets into a single-call safe API — every
-    // caller (CLI or otherwise) gets the seed-vs-xpub check enforced
-    // by the lib, instead of having to remember to call
-    // `rebuild_singlesig` themselves.
-    //
-    // Returns Err when:
-    //   * The recovered metadata is empty (per-group majority vote
-    //     tied across all candidates) — in that state we have no xpub
-    //     to authenticate against, and silently returning the
-    //     unauthenticated mnemonic would let metadata-only tampering
-    //     downgrade a 24-word to a wrong 12-word, or splice halves
-    //     from different wallets into a hybrid mnemonic.
-    //   * The reconstructed wallet's no-passphrase xpub doesn't match
-    //     the metadata's `singlesig_xpub`.
+    // Authenticate the recovered mnemonic against the voted wallet metadata.
     let authenticate = |recovery: VssRecovery| -> Result<VssRecovery> {
         if recovery.metadata.singlesig_xpub.is_empty() || recovery.metadata.network.is_empty() {
             bail!(
@@ -1162,58 +952,23 @@ pub fn combine_vss_wallets(
         }),
         1 => authenticate(to_recovery(&mut successes)),
         _ => {
-            // Collapse: if every successful group recovered the *same*
-            // mnemonic (e.g. the user re-split the same wallet and kept
-            // both backups in the same directory), there is no real
-            // ambiguity and we can return that mnemonic. We only error
-            // when at least two groups recovered *different* mnemonics —
-            // that's the case where silently picking one would risk
-            // recovering the wrong wallet.
-            //
-            // Compare `&Mnemonic` directly (it derives `PartialEq`) rather
-            // than via `to_string()` — the latter would copy the seed
-            // phrase out into a non-zeroizing heap String just to perform
-            // an equality check.
+            // Identical recovered mnemonics can collapse if metadata agrees.
             let first_mnemonic: &Mnemonic = successes[0].0.expose_secret();
             let all_identical = successes
                 .iter()
                 .skip(1)
-                .all(|(s, _, _, _)| s.expose_secret() == first_mnemonic);
+                .all(|(s, _)| s.expose_secret() == first_mnemonic);
             if all_identical {
-                // The mnemonic matches across groups — collapse safely
-                // as long as the per-group metadata doesn't carry
-                // contradictory authoritative values. Empty (default)
-                // metadata isn't a contradiction; it just means that
-                // candidate had a tied vote and abstained. So we
-                // compare *non-empty* derived metadata only:
-                //   - all candidates derived empty metadata ⇒ collapse,
-                //     return empty metadata (caller will warn).
-                //   - exactly one distinct non-empty metadata across
-                //     candidates ⇒ collapse, return that one.
-                //   - two or more distinct non-empty metadatas
-                //     (e.g. Bitcoin vs Testnet for the same seed) ⇒
-                //     ambiguity error.
-                let derived: Vec<crate::wallet_description::SinglesigPublicMetadataV0> = successes
+                // Empty metadata abstains; non-empty identities and duress
+                // flags must agree across candidates.
+                let derived: Vec<SinglesigPublicMetadataV0> = successes
                     .iter()
-                    .map(|(_, group, lo, hi)| derive_metadata(group, lo, hi.as_deref()))
+                    .map(|(_, group)| derive_metadata(group))
                     .collect();
-                let is_empty = |m: &crate::wallet_description::SinglesigPublicMetadataV0| -> bool {
+                let is_empty = |m: &SinglesigPublicMetadataV0| -> bool {
                     m.singlesig_xpub.is_empty() || m.network.is_empty()
                 };
-                // Two compatibility checks that BOTH must pass for a
-                // collapse to be safe:
-                //   (1) The non-empty wallet-identity metadata
-                //       (xpub/network/script_type/…) must agree across
-                //       all candidates that have it. Empty metadata
-                //       just means "abstain" and doesn't conflict.
-                //   (2) The is_duress flag must agree across ALL
-                //       candidates, including those whose
-                //       wallet-identity metadata is empty. Otherwise a
-                //       duress candidate whose xpub vote tied could
-                //       silently collapse with a normal candidate, and
-                //       the user would lose either the duress warning
-                //       or the ability to do a passphrase restore.
-                let mut non_empty: Vec<&crate::wallet_description::SinglesigPublicMetadataV0> =
+                let mut non_empty: Vec<&SinglesigPublicMetadataV0> =
                     derived.iter().filter(|m| !is_empty(m)).collect();
                 let identity_agrees = match non_empty.len() {
                     0 => true,
@@ -1228,10 +983,7 @@ pub fn combine_vss_wallets(
                     .all(|m| m.is_duress == derived[0].is_duress);
                 let safe_to_collapse = identity_agrees && duress_agrees;
                 if safe_to_collapse {
-                    // Prefer the candidate that produced non-empty
-                    // metadata (so the caller gets the authenticated
-                    // metadata to cross-check against). If none are
-                    // non-empty, any candidate works.
+                    // Prefer the candidate with non-empty metadata.
                     let prefer_idx = derived.iter().position(|m| !is_empty(m));
                     if let Some(idx) = prefer_idx {
                         let last = successes.len() - 1;
@@ -1239,26 +991,18 @@ pub fn combine_vss_wallets(
                     }
                     return authenticate(to_recovery(&mut successes));
                 }
-                // Metadata conflict ⇒ fall through to the ambiguity
-                // error path below, which will list the candidate xpubs
-                // / configurations so the user can disambiguate.
+                // Metadata conflict falls through to the ambiguity error.
             }
             let n = successes.len();
-            // Use the *authenticated* per-group metadata (the same
-            // strict-majority / abstain logic applied during recovery)
-            // for the disambiguation hint. Reading xpub/duress straight
-            // off the first share would let a single tampered share
-            // make the user think they're picking a different wallet
-            // than they actually are.
+            // Use voted per-group metadata for the disambiguation hint.
             let summary: Vec<String> = successes
                 .iter()
-                .map(|(_, group, lo, hi)| {
-                    let derived = derive_metadata(group, lo, hi.as_deref());
+                .map(|(_, group)| {
+                    let derived = derive_metadata(group);
                     describe_share_group(group, &derived)
                 })
                 .collect();
-            // SecretBox<Mnemonic> values in `successes` are zeroized on drop
-            // when this scope exits, so the rejected secrets do not linger.
+            // Rejected SecretBox<Mnemonic> values zeroize on drop.
             Err(anyhow!(
                 "Ambiguous input: {n} independent share sets recovered different wallets. Re-run with the specific share files for the wallet you want. Candidates:\n{}",
                 summary.join("\n")
@@ -1267,21 +1011,12 @@ pub fn combine_vss_wallets(
     }
 }
 
-/// Build a one-line description of a share group for inclusion in
-/// disambiguation errors. Includes the wallet's xpub, threshold, share
-/// indexes, the most recent `created_at`, AND the per-group
-/// duress-vs-normal designation — important because two groups for the
-/// SAME seed (one normal split, one duress split) would otherwise look
-/// identical (same decoy xpub, same indexes), giving the user no way
-/// to pick between them.
+/// Build a one-line share-group description for disambiguation errors.
 fn describe_share_group(
-    group: &[&crate::wallet_description::VssJsonWalletDescriptionV0],
-    derived: &crate::wallet_description::SinglesigPublicMetadataV0,
+    group: &[VssJsonWalletDescriptionV0],
+    derived: &SinglesigPublicMetadataV0,
 ) -> String {
-    // Use the *derived* (strict-majority / abstain) metadata for the
-    // user-visible hint, NOT the first share's raw metadata. A single
-    // tampered share would otherwise be able to forge the disambiguation
-    // hint by claiming a different xpub or duress label.
+    // Use voted metadata, not the first share's mutable metadata copy.
     let xpub_hint: &str = if derived.singlesig_xpub.is_empty() {
         "<unauthenticated — share metadata vote tied>"
     } else {
@@ -2464,9 +2199,8 @@ mod tests {
         }
     }
 
-    /// Lower-level mirror of the above: at the `combine_shares_to_mnemonic`
-    /// API, tampering the `Share.threshold` field on every share of a
-    /// genuine 3-of-5 split (an attacker downgrading metadata to 2)
+    /// Lower-level mirror of the above: tampering the `threshold` field on
+    /// every VSS payload of a genuine 3-of-5 split
     /// must NOT trick combine into accepting 2 shares — Lagrange + Pedersen
     /// still demand the real polynomial. With 3 genuine shares supplied,
     /// recovery succeeds despite the lying metadata.
