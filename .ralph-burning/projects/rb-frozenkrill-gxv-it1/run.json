@@ -2,29 +2,64 @@
   "active_run": {
     "run_id": "run-20260502013456",
     "stage_cursor": {
-      "stage": "final_review",
+      "stage": "plan_and_implement",
       "cycle": 1,
       "attempt": 1,
-      "completion_round": 1
+      "completion_round": 2
     },
     "started_at": "2026-05-02T01:34:56.256335255Z",
     "prompt_hash_at_cycle_start": "b74da804b55b6342e521ba690ff57b58c9b384242fb7c0d814c1c4ca5c13c3c2",
     "prompt_hash_at_stage_start": "b74da804b55b6342e521ba690ff57b58c9b384242fb7c0d814c1c4ca5c13c3c2",
     "qa_iterations_current_cycle": 0,
     "review_iterations_current_cycle": 0,
-    "final_review_restart_count": 0
+    "final_review_restart_count": 1
   },
   "status": "running",
   "cycle_history": [],
-  "completion_rounds": 1,
+  "completion_rounds": 2,
   "max_completion_rounds": 25,
   "rollback_point_meta": {
     "last_rollback_id": null,
     "rollback_count": 0
   },
   "amendment_queue": {
-    "pending": [],
+    "pending": [
+      {
+        "amendment_id": "fr-1-aa5e9948",
+        "source_stage": "final_review",
+        "source_cycle": 1,
+        "source_completion_round": 1,
+        "body": "frozenkrill-core/src/secret_sharing.rs:365-378: `verify_vsss_share_pair` parses the secret and blinder shares and then calls `verify_share_and_blinder` without first checking that their typed identifiers match. The stricter combine path does reject mismatches in `verified_unique_share_pairs` at frozenkrill-core/src/secret_sharing.rs:640-648, but this helper is used for `verified_inputs` and metadata voting at frozenkrill-core/src/secret_sharing.rs:1180, 1200, 1247, and 1264. Because the vsss verifier evaluates with the secret share's identifier, a structurally invalid pair with a tampered blinder identifier can be treated as verified for metadata even though it would not contribute to reconstruction. Mirror the identifier equality check in `verify_vsss_share_pair` before calling `verify_share_and_blinder`.",
+        "created_at": "2026-05-02T02:10:51.151982685Z",
+        "batch_sequence": 1,
+        "source": "workflow_stage",
+        "dedup_key": "9a354691c426bc86240f25dec1731582a93a1425d0d7daaebb47869293608fbd",
+        "classification": "fix_current_bead"
+      }
+    ],
     "processed_count": 0
   },
-  "status_summary": "running: completed Plan and Implement, next Final Review"
+  "status_summary": "running: final review restart round 2 -> Plan and Implement",
+  "last_stage_resolution_snapshot": {
+    "stage_id": "final_review",
+    "resolved_at": "2026-05-02T01:51:40.163053280Z",
+    "final_review_reviewers": [
+      {
+        "backend_family": "codex",
+        "model_id": "gpt-5.5-xhigh"
+      },
+      {
+        "backend_family": "claude",
+        "model_id": "claude-opus-4-7-max"
+      },
+      {
+        "backend_family": "codex",
+        "model_id": "gpt-5.3-codex-spark-xhigh"
+      }
+    ],
+    "final_review_arbiter": {
+      "backend_family": "codex",
+      "model_id": "gpt-5.5-xhigh"
+    }
+  }
 }
