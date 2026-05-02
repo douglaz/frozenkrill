@@ -130,29 +130,43 @@ Shares are stored as encrypted .frozenkrill wallet files with the following stru
   "share_index": 2,
   "threshold": 3,
   "total_shares": 5,
-  "share_data": "base64-encoded-share",
-  "verification_data": "base64-encoded-commitments",
+  "mnemonic_length": 24,
+  "share_data": "hex-encoded-low-share",
+  "blinder_share_data": "hex-encoded-low-blinder-share",
+  "verification_data": "hex-encoded-low-commitment,hex-encoded-low-commitment,...",
+  "share_data_hi": "hex-encoded-high-share",
+  "blinder_share_data_hi": "hex-encoded-high-blinder-share",
+  "verification_data_hi": "hex-encoded-high-commitment,hex-encoded-high-commitment,...",
   "created_at": "2025-10-31T12:00:00Z",
   "original_wallet": {
-    "wallet_type": "singlesig",
     "version": 0,
+    "sigtype": "single",
+    "master_fingerprint": "abcd1234",
+    "singlesig_xpub": "xpub...",
+    "singlesig_derivation_path": "m/84'/0'/0'",
+    "multisig_xpub": "xpub...",
+    "multisig_derivation_path": "m/48'/0'/0'/2'",
+    "singlesig_first_address": "bc1q...",
+    "singlesig_receiving_output_descriptor": "wpkh(...)",
+    "singlesig_change_output_descriptor": "wpkh(...)",
     "network": "bitcoin",
     "script_type": "segwit_native",
-    "seed_phrase": "[redacted - this is the SAME for all shares]",
-    "descriptors": { ... },
-    "public_keys": { ... }
+    "is_duress": false
   }
 }
 ```
 
+The `*_hi` fields are present only for 24-word mnemonics. A 12-word split
+contains only the low-share fields.
+
 ### File Format Design
 
 - **Encrypted format**: Each share is a fully encrypted .frozenkrill wallet file
-- **Complete metadata**: Shares include full wallet metadata (network, script type, descriptors, public keys)
+- **Public metadata only**: Shares include wallet metadata needed for verification and watch-only use (network, script type, xpubs, derivation paths, descriptors, first address) but do not include the seed phrase or xprivs
 - **Watch-only capable**: Shares can be used for watch-only wallet monitoring without reconstruction
 - **Version field**: Forward compatibility for future improvements
 - **Metadata**: Threshold and total shares info for validation
-- **Verification data**: Pedersen commitments for share verification
+- **Share data**: Secret shares, blinder shares, and Pedersen commitments are hex-encoded
 - **Timestamp**: ISO 8601 creation timestamp
 
 ## Example Scenarios
@@ -263,7 +277,7 @@ A: No, the total number of shares is fixed at creation time.
 A: Yes, the `split-secret` command works with any existing frozenkrill wallet.
 
 **Q: Is this compatible with hardware wallets?**
-A: The shares encode your seed phrase, which can be used with any BIP-39 compatible wallet.
+A: The shares reconstruct your BIP-39 seed phrase when the threshold is met, and that seed phrase can be used with any BIP-39 compatible wallet.
 
 **Q: What happens if I lose my original wallet after splitting?**
 A: You can reconstruct the seed from the shares and create a new wallet.
@@ -272,7 +286,7 @@ A: You can reconstruct the seed from the shares and create a new wallet.
 A: There is NO way to recover shares without the password. This is why you must test the entire process and verify you can reconstruct the seed before relying on it.
 
 **Q: Can someone with one share see my wallet balance?**
-A: Yes! Each share contains the complete wallet metadata including public keys and descriptors. Shares can be used as watch-only wallets to monitor balances. This is by design for inheritance planning.
+A: Yes. Each share contains public wallet metadata such as xpubs, descriptors, and the first address. Shares can be used as watch-only wallets to monitor balances. This is by design for inheritance planning.
 
 **Q: Is this the same as Shamir's Secret Sharing?**
 A: Almost! Pedersen VSS **is** Shamir's Secret Sharing, but with an important enhancement. It uses the same mathematical foundation (Shamir's polynomial scheme) for splitting and reconstructing secrets, but adds Pedersen commitments that allow verifying shares are valid without revealing the secret. Think of it as "Shamir's Secret Sharing 2.0" - the same core algorithm made better with verification.
