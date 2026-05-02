@@ -2,34 +2,47 @@
   "active_run": {
     "run_id": "run-20260502013456",
     "stage_cursor": {
-      "stage": "final_review",
+      "stage": "plan_and_implement",
       "cycle": 1,
       "attempt": 1,
-      "completion_round": 3
+      "completion_round": 4
     },
     "started_at": "2026-05-02T01:34:56.256335255Z",
     "prompt_hash_at_cycle_start": "b74da804b55b6342e521ba690ff57b58c9b384242fb7c0d814c1c4ca5c13c3c2",
     "prompt_hash_at_stage_start": "b74da804b55b6342e521ba690ff57b58c9b384242fb7c0d814c1c4ca5c13c3c2",
     "qa_iterations_current_cycle": 0,
     "review_iterations_current_cycle": 0,
-    "final_review_restart_count": 2
+    "final_review_restart_count": 3
   },
   "status": "running",
   "cycle_history": [],
-  "completion_rounds": 3,
+  "completion_rounds": 4,
   "max_completion_rounds": 25,
   "rollback_point_meta": {
     "last_rollback_id": null,
     "rollback_count": 0
   },
   "amendment_queue": {
-    "pending": [],
+    "pending": [
+      {
+        "amendment_id": "fr-3-5382e896",
+        "source_stage": "final_review",
+        "source_cycle": 1,
+        "source_completion_round": 3,
+        "body": "Remove the `result` symlink committed at the repo root and add it to `.gitignore`.\n\nThe `result` symlink (currently pointing at `/nix/store/jh0d0mapva43v7g66jby7hmrxap57mck-frozenkrill-0.0.0`) was inadvertently staged by a ralph-burning checkpoint at commit `90e9c7e` when this run invoked `nix build`. `result` is a build-output symlink that nix recreates with a different store-hash on every code change, so committing it means future `nix build` invocations will show it as a stale-but-tracked file — every contributor will see it as a phantom diff in `git status` and risk re-committing the new path each time.\n\nFix steps in this bead:\n1. `rm result`\n2. add a `result` (or `result*` to also catch `result-1`, `result-bin`, …) entry to `.gitignore` next to the existing `target/` rule\n3. `git add .gitignore && git rm result`\n\nThis is in scope for the current bead because the artifact was created by *this* run's nix-build invocations and would otherwise leak into the bead's PR.",
+        "created_at": "2026-05-02T02:56:01.576036526Z",
+        "batch_sequence": 1,
+        "source": "workflow_stage",
+        "dedup_key": "a087bd5adcfeab80161890655d1fa1393cfd4f753a1ff6fb611df225039a2704",
+        "classification": "fix_current_bead"
+      }
+    ],
     "processed_count": 2
   },
-  "status_summary": "running: completed Plan and Implement, next Final Review",
+  "status_summary": "running: final review restart round 4 -> Plan and Implement",
   "last_stage_resolution_snapshot": {
     "stage_id": "final_review",
-    "resolved_at": "2026-05-02T02:16:49.963225032Z",
+    "resolved_at": "2026-05-02T02:43:34.274900072Z",
     "final_review_reviewers": [
       {
         "backend_family": "codex",
