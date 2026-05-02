@@ -93,9 +93,14 @@ pub(crate) fn split_singlesig_wallet(
     let spinner = get_spinner("Splitting seed into shares using Pedersen scheme...");
 
     // Perform the split using the core function
-    let vss_wallets =
-        split_singlesig_wallet_core(wallet_json.expose_secret(), threshold, total_shares, is_duress, rng)
-            .context("Failed to split wallet into shares")?;
+    let vss_wallets = split_singlesig_wallet_core(
+        wallet_json.expose_secret(),
+        threshold,
+        total_shares,
+        is_duress,
+        rng,
+    )
+    .context("Failed to split wallet into shares")?;
 
     spinner.finish_with_message("✓ Seed successfully split into shares");
 
@@ -251,8 +256,7 @@ pub(crate) fn split_singlesig_wallet(
             // encrypted-share artifacts that should not stay on disk
             // after a failed run. The deletes are idempotent: paths
             // that were already cleaned simply fail silently.
-            let all_partials: Vec<PathBuf> =
-                pending.iter().map(|p| p.partial.clone()).collect();
+            let all_partials: Vec<PathBuf> = pending.iter().map(|p| p.partial.clone()).collect();
             cleanup(&all_partials, &finals_renamed);
             return Err(e);
         }
@@ -300,9 +304,7 @@ pub(crate) fn split_singlesig_wallet(
         difficulty != frozenkrill_core::key_derivation::DEFAULT_DIFFICULTY_LEVEL;
     if custom_keyfiles || custom_difficulty {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!(
-            "⚠️  RECORD THESE PARAMETERS — required to decrypt the shares later:"
-        );
+        println!("⚠️  RECORD THESE PARAMETERS — required to decrypt the shares later:");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         for k in keyfiles {
             println!("    --keyfile {}", k.display());
@@ -354,9 +356,8 @@ fn finalize_share(partial: &Path, final_path: &Path) -> anyhow::Result<()> {
             // unlink the half-written destination so the all-or-nothing
             // contract still holds and the outer rollback in `split-secret`
             // doesn't leave a truncated `share-*.frozenkrill` behind.
-            let mut src = std::fs::File::open(partial).with_context(|| {
-                format!("opening partial share file: {}", partial.display())
-            })?;
+            let mut src = std::fs::File::open(partial)
+                .with_context(|| format!("opening partial share file: {}", partial.display()))?;
             let mut dst = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -369,11 +370,7 @@ fn finalize_share(partial: &Path, final_path: &Path) -> anyhow::Result<()> {
                 })?;
             let copy_result = (|| -> anyhow::Result<()> {
                 std::io::copy(&mut src, &mut dst).with_context(|| {
-                    format!(
-                        "copying {} → {}",
-                        partial.display(),
-                        final_path.display()
-                    )
+                    format!("copying {} → {}", partial.display(), final_path.display())
                 })?;
                 dst.sync_all().with_context(|| {
                     format!("syncing final share file: {}", final_path.display())
