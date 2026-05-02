@@ -53,7 +53,7 @@ Pedersen VSS solves this by allowing share holders to verify their shares are ge
 
 ⚠️ **Threshold security**: Anyone with M shares can reconstruct your seed and access ALL funds
 ⚠️ **Share loss**: Losing too many shares (>N-M) means PERMANENT loss of funds
-⚠️ **Password protection**: Shares are encrypted - you MUST remember the password used during splitting
+⚠️ **Password protection**: Shares are encrypted - you MUST remember the share password and any share keyfiles used during splitting
 ⚠️ **Under audit**: vsss-rs library includes a warning about audit status - use at your own risk
 ⚠️ **Distribution risk**: The distribution process itself creates temporary risk
 
@@ -80,7 +80,7 @@ frozenkrill split-secret \
   --threshold 3 \
   --total-shares 5 \
   --output-dir /path/to/shares \
-  --password mypassword \
+  --password source-wallet-password \
   --keyfile /path/to/keyfile \
   --difficulty normal
 ```
@@ -90,12 +90,16 @@ frozenkrill split-secret \
 - `--threshold`: Minimum shares needed to reconstruct (M)
 - `--total-shares`: Total shares to create (N)
 - `--output-dir`: Directory where share files will be written (default: current directory)
-- `--password`: Password for encrypting shares (will prompt if not provided)
-- `--keyfile`: Optional keyfile(s) for share encryption
-- `--difficulty`: Key derivation difficulty (easy/normal/hard/veryhard)
+- `--password`: Password used to open the source wallet (will prompt if not provided)
+- `--keyfile`: Optional keyfile(s) used to open the source wallet
+- `--difficulty`: Key derivation difficulty used to open the source wallet (easy/normal/hard/veryhard)
 - `--enable-duress-wallet`: Use duress wallet instead of main wallet
 - `--disable-all-padding`: Disable padding (not recommended)
-- `--wallet-file-type`: standard or compact (default: standard)
+- `--share-password`: Optional password used to encrypt the share files; defaults to the source wallet password
+- `--share-keyfile`: Optional keyfile(s) used to encrypt the share files; defaults to the source wallet keyfiles
+- `--no-share-keyfile`: Encrypt the share files without keyfiles even when the source wallet used keyfiles
+- `--share-difficulty`: Optional key derivation difficulty for share encryption; defaults to the source wallet difficulty
+- VSS share files are always written in the standard encrypted wallet format
 
 **Output:**
 Creates encrypted files named: `share-1-of-5-20251031-120000.frozenkrill`, `share-2-of-5-20251031-120000.frozenkrill`, etc.
@@ -106,13 +110,12 @@ To reconstruct the seed phrase from shares:
 
 ```bash
 frozenkrill combine-secret \
-  share-1-of-5.frozenkrill share-3-of-5.frozenkrill share-4-of-5.frozenkrill \
-  --display-mnemonic
+  share-1-of-5.frozenkrill share-3-of-5.frozenkrill share-4-of-5.frozenkrill
 ```
 
 **Parameters:**
 - Provide M or more share file paths as arguments
-- `--display-mnemonic`: Display the reconstructed mnemonic on screen (⚠️ **SENSITIVE!**)
+- The reconstructed mnemonic is printed on success (⚠️ **SENSITIVE!**)
 
 **Alternative**: Provide a directory and it will use all `.frozenkrill` files found:
 
@@ -130,29 +133,41 @@ Shares are stored as encrypted .frozenkrill wallet files with the following stru
   "share_index": 2,
   "threshold": 3,
   "total_shares": 5,
-  "share_data": "base64-encoded-share",
-  "verification_data": "base64-encoded-commitments",
+  "mnemonic_length": 24,
+  "share_data": "hex-encoded-low-share",
+  "blinder_share_data": "hex-encoded-low-blinder-share",
+  "verification_data": "hex-encoded-low-commitment,hex-encoded-low-commitment,...",
+  "share_data_hi": "hex-encoded-high-share",
+  "blinder_share_data_hi": "hex-encoded-high-blinder-share",
+  "verification_data_hi": "hex-encoded-high-commitment,hex-encoded-high-commitment,...",
   "created_at": "2025-10-31T12:00:00Z",
   "original_wallet": {
-    "wallet_type": "singlesig",
     "version": 0,
+    "sigtype": "singlesig",
+    "master_fingerprint": "abcd1234",
+    "singlesig_xpub": "xpub...",
+    "singlesig_derivation_path": "m/84'/0'/0'",
+    "singlesig_first_address": "bc1q...",
+    "singlesig_receiving_output_descriptor": "wpkh(...)",
+    "singlesig_change_output_descriptor": "wpkh(...)",
     "network": "bitcoin",
-    "script_type": "segwit_native",
-    "seed_phrase": "[redacted - this is the SAME for all shares]",
-    "descriptors": { ... },
-    "public_keys": { ... }
+    "script_type": "segwit-native",
+    "is_duress": false
   }
 }
 ```
 
+The `*_hi` fields are present only for 24-word mnemonics. A 12-word split
+contains only the low-share fields.
+
 ### File Format Design
 
 - **Encrypted format**: Each share is a fully encrypted .frozenkrill wallet file
-- **Complete metadata**: Shares include full wallet metadata (network, script type, descriptors, public keys)
+- **Public metadata only**: Shares include wallet metadata needed for verification and watch-only use (network, script type, xpubs, derivation paths, descriptors, first address) but do not include the seed phrase or xprivs
 - **Watch-only capable**: Shares can be used for watch-only wallet monitoring without reconstruction
 - **Version field**: Forward compatibility for future improvements
 - **Metadata**: Threshold and total shares info for validation
-- **Verification data**: Pedersen commitments for share verification
+- **Share data**: Secret shares, blinder shares, and Pedersen commitments are hex-encoded
 - **Timestamp**: ISO 8601 creation timestamp
 
 ## Example Scenarios
@@ -263,7 +278,7 @@ A: No, the total number of shares is fixed at creation time.
 A: Yes, the `split-secret` command works with any existing frozenkrill wallet.
 
 **Q: Is this compatible with hardware wallets?**
-A: The shares encode your seed phrase, which can be used with any BIP-39 compatible wallet.
+A: The shares reconstruct your BIP-39 seed phrase when the threshold is met, and that seed phrase can be used with any BIP-39 compatible wallet.
 
 **Q: What happens if I lose my original wallet after splitting?**
 A: You can reconstruct the seed from the shares and create a new wallet.
@@ -272,7 +287,7 @@ A: You can reconstruct the seed from the shares and create a new wallet.
 A: There is NO way to recover shares without the password. This is why you must test the entire process and verify you can reconstruct the seed before relying on it.
 
 **Q: Can someone with one share see my wallet balance?**
-A: Yes! Each share contains the complete wallet metadata including public keys and descriptors. Shares can be used as watch-only wallets to monitor balances. This is by design for inheritance planning.
+A: Yes. Each share contains public wallet metadata such as xpubs, descriptors, and the first address. Shares can be used as watch-only wallets to monitor balances. This is by design for inheritance planning.
 
 **Q: Is this the same as Shamir's Secret Sharing?**
 A: Almost! Pedersen VSS **is** Shamir's Secret Sharing, but with an important enhancement. It uses the same mathematical foundation (Shamir's polynomial scheme) for splitting and reconstructing secrets, but adds Pedersen commitments that allow verifying shares are valid without revealing the secret. Think of it as "Shamir's Secret Sharing 2.0" - the same core algorithm made better with verification.

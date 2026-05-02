@@ -1290,17 +1290,8 @@ pub struct SinglesigPublicMetadataV0 {
     pub singlesig_change_output_descriptor: String,
     pub network: String,
     pub script_type: String,
-    /// `true` iff this share was created with `--enable-duress-wallet`,
-    /// in which case the embedded xpub/addresses describe the *decoy*
-    /// wallet and the real wallet must be restored by combining the
-    /// recovered seed with the non-duress BIP-39 passphrase the user
-    /// remembers separately. `false` for normal shares — for those a
-    /// passphrase MUST NOT be supplied at restore time, or `to_singlesig`
-    /// would silently return an unrelated wallet derived from a typo.
-    ///
-    /// Defaults to `false` on deserialization so older shares (written
-    /// before this field existed) are treated as normal, non-duress
-    /// shares — the conservative choice.
+    /// `true` for duress-mode shares, whose embedded xpub/addresses describe
+    /// the decoy wallet. Defaults to normal/non-duress for older shares.
     #[serde(default)]
     pub is_duress: bool,
 }
@@ -1327,27 +1318,8 @@ impl SinglesigPublicMetadataV0 {
     }
 }
 
-/// Tagged enum for nesting original wallet metadata inside VSS shares.
-///
-/// Only stores public information. The actual secret (the seed) lives in the
-/// share data and is reconstructed via the threshold scheme.
-#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
-#[serde(tag = "wallet_type")]
-pub enum OriginalWalletJson {
-    #[serde(rename = "singlesig")]
-    Singlesig(SinglesigPublicMetadataV0),
-
-    #[serde(rename = "multisig")]
-    Multisig(MultisigJsonWalletDescriptionV0),
-}
-
 /// VSS (Verifiable Secret Sharing) wallet description containing one share and
-/// public metadata about the original wallet.
-///
-/// Uses Shamir's polynomial scheme for M-of-N threshold reconstruction plus
-/// Pedersen commitments for verifiability. 24-word mnemonics are split across
-/// two parallel VSS instances (one per 16 entropy bytes) and so carry an
-/// additional `_hi` share + verifier set; 12-word mnemonics leave those `None`.
+/// public metadata about the original singlesig wallet.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
 pub struct VssJsonWalletDescriptionV0 {
     pub version: WalletVersionType,
@@ -1356,14 +1328,11 @@ pub struct VssJsonWalletDescriptionV0 {
     pub total_shares: u8,
     /// 12 or 24
     pub mnemonic_length: u8,
-    /// Secret share of the low 16 entropy bytes (hex-encoded).
+    /// Secret share of the low 16 entropy bytes (hex).
     pub share_data: String,
-    /// Blinder share of the low 16 entropy bytes (hex). Required to verify
-    /// `share_data` against the Pedersen commitments without learning the
-    /// secret value.
+    /// Blinder share of the low 16 entropy bytes (hex).
     pub blinder_share_data: String,
-    /// Pedersen commitments for the low half (hex, comma-separated):
-    /// `[g, h, C_0, ..., C_{t-1}]`. Used by combine to verify each share.
+    /// Pedersen commitments for the low half (hex, comma-separated).
     pub verification_data: String,
     /// Secret share of the high 16 entropy bytes (hex). Only present for 24-word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1375,7 +1344,7 @@ pub struct VssJsonWalletDescriptionV0 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_data_hi: Option<String>,
     pub created_at: String,
-    pub original_wallet: OriginalWalletJson,
+    pub original_wallet: SinglesigPublicMetadataV0,
 }
 
 impl VssJsonWalletDescriptionV0 {
@@ -1411,23 +1380,14 @@ impl VssJsonWalletDescriptionV0 {
             blinder_share_data_hi,
             verification_data_hi,
             created_at: chrono::Utc::now().to_rfc3339(),
-            original_wallet: OriginalWalletJson::Singlesig(
-                SinglesigPublicMetadataV0::from_singlesig_json(wallet_json, is_duress),
-            ),
+            original_wallet: SinglesigPublicMetadataV0::from_singlesig_json(wallet_json, is_duress),
         }
     }
 
-    /// Reconstruct a singlesig wallet from a recovered mnemonic and the public
-    /// metadata in this share, then assert that the rebuilt wallet's xpub
-    /// matches the metadata's `singlesig_xpub`. The xpub check rejects a
-    /// tampered share that tries to redirect the user to a different wallet.
-    /// Per-share rebuild path. **Internal**: external callers should
-    /// go through `VssRecovery::rebuild_singlesig`, which makes the
-    /// duress decision from group-aggregated metadata. Per-share
-    /// `is_duress` is mutable JSON; on this single-share entry point
-    /// we therefore conservatively refuse a passphrase regardless of
-    /// the field's value, since we cannot tell from one share whether
-    /// the recovery is duress or not.
+    /// Internal per-share rebuild path. It authenticates the rebuilt xpub
+    /// against the share metadata, but refuses passphrases because a single
+    /// share's `is_duress` flag is mutable JSON. External callers should use
+    /// `VssRecovery::rebuild_singlesig`, which uses group-aggregated metadata.
     #[cfg(test)]
     pub(crate) fn to_singlesig(
         &self,
@@ -1435,32 +1395,17 @@ impl VssJsonWalletDescriptionV0 {
         seed_password: &Option<Arc<SecretString>>,
         secp: &Secp256k1<All>,
     ) -> anyhow::Result<SingleSigWalletDescriptionV0> {
-        let metadata = match &self.original_wallet {
-            OriginalWalletJson::Singlesig(m) => m,
-            OriginalWalletJson::Multisig(_) => {
-                bail!("Cannot reconstruct singlesig wallet from multisig share")
-            }
-        };
+        let metadata = &self.original_wallet;
 
-        // Per BIP-39 an empty passphrase is equivalent to no
-        // passphrase at all. Normalize `Some("")` to `None` so callers
-        // that always forward `SecretString` — even when the user
-        // pressed Enter — don't trip the refusal below.
+        // Per BIP-39 an empty passphrase is equivalent to no passphrase.
         let effective_seed_password: Option<Arc<SecretString>> = match seed_password {
             Some(pw) if !pw.expose_secret().is_empty() => Some(Arc::clone(pw)),
             _ => None,
         };
         let effective_seed_password_ref = &effective_seed_password;
 
-        // CONSERVATIVE per-share policy: we refuse passphrases here
-        // regardless of `metadata.is_duress`. The `is_duress` byte on
-        // a single share is mutable JSON — an attacker could flip it
-        // on a normal share and use that to silently send a passphrase
-        // restore to an unrelated wallet. This function therefore
-        // does not have enough information to distinguish duress from
-        // normal recovery on its own. External callers performing a
-        // duress restore must go through `VssRecovery::rebuild_singlesig`
-        // instead, which uses *group-aggregated* duress consensus.
+        // Per-share policy: refuse passphrases regardless of `is_duress`.
+        // Duress restores must use the group-aggregated recovery path.
         if effective_seed_password.is_some() {
             bail!(
                 "Per-share `to_singlesig` does not accept a BIP-39 passphrase: a single \
@@ -1484,25 +1429,8 @@ impl VssJsonWalletDescriptionV0 {
             )
         })?;
 
-        // Authenticate the share metadata BEFORE returning anything.
-        //
-        // The share's `singlesig_xpub` was always derived from
-        // (mnemonic + no passphrase) at split time — for plain shares
-        // that's literally the wallet xpub; for duress-mode shares the
-        // metadata is intentionally pinned to the *decoy* wallet, which
-        // is also the no-passphrase derivation of the same mnemonic.
-        // So we can always reconstruct a no-passphrase wallet here and
-        // require its xpub to match the stored xpub. This catches
-        // tampered `network`, `script_type`, or `singlesig_xpub` fields
-        // regardless of whether the caller supplies a passphrase.
-        //
-        // What this does NOT catch: a wrong (typo'd) BIP-39 passphrase
-        // on a duress-mode restore. There is no on-disk artifact to
-        // compare the passphrase-derived wallet against — the whole
-        // point of plausible deniability is that the real wallet is not
-        // referenced anywhere on disk. The user is responsible for
-        // checking the recovered wallet's first address against an
-        // external known reference.
+        // Authenticate metadata before returning anything. Share xpubs are
+        // derived from the no-passphrase wallet (the decoy in duress mode).
         let metadata_witness = SingleSigWalletDescriptionV0::generate(
             Arc::clone(&mnemonic),
             &None,
@@ -1516,10 +1444,6 @@ impl VssJsonWalletDescriptionV0 {
              from a different wallet or its metadata may have been tampered with"
         );
 
-        // Now build the wallet the caller actually asked for. If they
-        // supplied no passphrase (or an empty one normalized above),
-        // that's the same wallet we just used for verification;
-        // otherwise, derive with the passphrase.
         if effective_seed_password_ref.is_none() {
             return Ok(metadata_witness);
         }
@@ -1530,16 +1454,6 @@ impl VssJsonWalletDescriptionV0 {
             script_type,
             secp,
         )
-    }
-
-    /// Check if this is a singlesig share
-    pub fn is_singlesig(&self) -> bool {
-        matches!(self.original_wallet, OriginalWalletJson::Singlesig(_))
-    }
-
-    /// Check if this is a multisig share
-    pub fn is_multisig(&self) -> bool {
-        matches!(self.original_wallet, OriginalWalletJson::Multisig(_))
     }
 
     /// Deserialize from JSON

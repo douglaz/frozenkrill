@@ -810,7 +810,7 @@ pub fn combine_vss_wallets(
         bail!(anyhow!("No VSS wallets provided"));
     }
 
-    // Do not prefilter mutable wallet_type metadata; Pedersen verification
+    // Do not prefilter mutable JSON metadata; Pedersen verification
     // decides which secret bytes belong to the candidate.
     let vss_wallets_owned: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
         vss_wallets.iter().collect();
@@ -1036,20 +1036,14 @@ pub fn combine_vss_wallets(
         // empty `network` / `script_type` even though the rest of the
         // metadata is intact.
         let canonicalize_duress =
-            |o: &crate::wallet_description::OriginalWalletJson|
-             -> crate::wallet_description::OriginalWalletJson {
-                match o {
-                    crate::wallet_description::OriginalWalletJson::Singlesig(m) => {
-                        let mut m_copy = m.clone();
-                        m_copy.is_duress = false;
-                        crate::wallet_description::OriginalWalletJson::Singlesig(m_copy)
-                    }
-                    crate::wallet_description::OriginalWalletJson::Multisig(m) => {
-                        crate::wallet_description::OriginalWalletJson::Multisig(m.clone())
-                    }
-                }
+            |m: &crate::wallet_description::SinglesigPublicMetadataV0|
+             -> crate::wallet_description::SinglesigPublicMetadataV0 {
+                let mut m_copy = m.clone();
+                m_copy.is_duress = false;
+                m_copy
             };
-        let mut counts: Vec<(usize, crate::wallet_description::OriginalWalletJson)> = Vec::new();
+        let mut counts: Vec<(usize, crate::wallet_description::SinglesigPublicMetadataV0)> =
+            Vec::new();
         for w in tally_source {
             let key = canonicalize_duress(&w.original_wallet);
             if let Some(entry) = counts.iter_mut().find(|e| e.1 == key) {
@@ -1087,10 +1081,7 @@ pub fn combine_vss_wallets(
         // hands an attacker-controlled wallet to the user.
         let duress_yes = tally_source
             .iter()
-            .filter(|w| match &w.original_wallet {
-                crate::wallet_description::OriginalWalletJson::Singlesig(m) => m.is_duress,
-                crate::wallet_description::OriginalWalletJson::Multisig(_) => false,
-            })
+            .filter(|w| w.original_wallet.is_duress)
             .count();
         let any_duress = duress_yes * 2 > tally_source.len();
         let strict_majority = top_groups == 1 && top_count * 2 > total_votes;
@@ -1100,12 +1091,7 @@ pub fn combine_vss_wallets(
                 .max_by_key(|(c, _)| *c)
                 .expect("non-empty group")
                 .1;
-            match majority {
-                crate::wallet_description::OriginalWalletJson::Singlesig(m) => m.clone(),
-                crate::wallet_description::OriginalWalletJson::Multisig(_) => {
-                    crate::wallet_description::SinglesigPublicMetadataV0::default()
-                }
-            }
+            majority.clone()
         } else {
             log::warn!(
                 "Pedersen-verified share group has conflicting `original_wallet` metadata \
@@ -1658,8 +1644,7 @@ mod tests {
     fn test_recovery_metadata_fails_closed_on_tie() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
-            OriginalWalletJson, ScriptType, SingleSigWalletDescriptionV0,
-            SinglesigJsonWalletDescriptionV0,
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
         };
         use std::str::FromStr;
         use std::sync::Arc;
@@ -1683,9 +1668,7 @@ mod tests {
         let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 2, false, &mut rng).unwrap();
         // Tamper with one of the two shares' xpub. Now the vote is
         // 1 (real) vs 1 (forgery) — no strict majority.
-        if let OriginalWalletJson::Singlesig(ref mut m) = vss[0].original_wallet {
-            m.singlesig_xpub = "zpub6tampered00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string();
-        }
+        vss[0].original_wallet.singlesig_xpub = "zpub6tampered00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string();
 
         let err = match combine_vss_wallets(&vss) {
             Ok(_) => panic!("expected combine_vss_wallets to fail closed on tied metadata"),
@@ -1708,8 +1691,7 @@ mod tests {
     fn test_recovery_metadata_uses_majority_against_tampered_share() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
-            OriginalWalletJson, ScriptType, SingleSigWalletDescriptionV0,
-            SinglesigJsonWalletDescriptionV0,
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
         };
         use std::str::FromStr;
         use std::sync::Arc;
@@ -1729,17 +1711,12 @@ mod tests {
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
         let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 5, false, &mut rng).unwrap();
-        let real_xpub = match &vss[0].original_wallet {
-            OriginalWalletJson::Singlesig(m) => m.singlesig_xpub.clone(),
-            _ => panic!("expected singlesig"),
-        };
+        let real_xpub = vss[0].original_wallet.singlesig_xpub.clone();
 
         // Tamper with one share's xpub. Real metadata is in 4 of 5 shares
         // (majority); this forgery is in 1 of 5 (minority).
-        if let OriginalWalletJson::Singlesig(ref mut m) = vss[0].original_wallet {
-            m.singlesig_xpub =
-                "zpub6tampered00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string();
-        }
+        vss[0].original_wallet.singlesig_xpub =
+            "zpub6tampered00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string();
 
         let recovered = combine_vss_wallets(&vss).unwrap();
         assert_eq!(
@@ -1759,8 +1736,7 @@ mod tests {
     fn test_combine_strict_majority_is_duress_aggregation() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
-            OriginalWalletJson, ScriptType, SingleSigWalletDescriptionV0,
-            SinglesigJsonWalletDescriptionV0,
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
         };
         use std::str::FromStr;
         use std::sync::Arc;
@@ -1785,9 +1761,7 @@ mod tests {
         // recovery is still flagged as duress.
         let mut duress_vss =
             split_singlesig_wallet(json.expose_secret(), 2, 3, true, &mut rng).unwrap();
-        if let OriginalWalletJson::Singlesig(ref mut m) = duress_vss[0].original_wallet {
-            m.is_duress = false;
-        }
+        duress_vss[0].original_wallet.is_duress = false;
         let recovered = combine_vss_wallets(&duress_vss).unwrap();
         assert!(
             recovered.metadata.is_duress,
@@ -1801,9 +1775,7 @@ mod tests {
         // this single-share tamper to authorize a passphrase restore.
         let mut normal_vss =
             split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
-        if let OriginalWalletJson::Singlesig(ref mut m) = normal_vss[0].original_wallet {
-            m.is_duress = true;
-        }
+        normal_vss[0].original_wallet.is_duress = true;
         let recovered = combine_vss_wallets(&normal_vss).unwrap();
         assert!(
             !recovered.metadata.is_duress,
@@ -1824,8 +1796,7 @@ mod tests {
     fn test_combine_treats_normal_vs_duress_same_seed_as_ambiguous() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
-            OriginalWalletJson, ScriptType, SingleSigWalletDescriptionV0,
-            SinglesigJsonWalletDescriptionV0,
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
         };
         use std::str::FromStr;
         use std::sync::Arc;
@@ -1857,14 +1828,8 @@ mod tests {
             .collect();
 
         // Sanity-check: the two share sets do carry different is_duress flags.
-        let normal_duress = match &normal[0].original_wallet {
-            OriginalWalletJson::Singlesig(m) => m.is_duress,
-            _ => panic!("expected singlesig"),
-        };
-        let duress_duress = match &duress[0].original_wallet {
-            OriginalWalletJson::Singlesig(m) => m.is_duress,
-            _ => panic!("expected singlesig"),
-        };
+        let normal_duress = normal[0].original_wallet.is_duress;
+        let duress_duress = duress[0].original_wallet.is_duress;
         assert!(!normal_duress);
         assert!(duress_duress);
 
@@ -2002,8 +1967,7 @@ mod tests {
     fn test_vss_to_singlesig_rejects_tampered_xpub() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
-            OriginalWalletJson, ScriptType, SingleSigWalletDescriptionV0,
-            SinglesigJsonWalletDescriptionV0,
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
         };
         use std::str::FromStr;
         use std::sync::Arc;
@@ -2042,13 +2006,9 @@ mod tests {
         .unwrap();
         let bad_xpub = other_wallet.encoded_singlesig_xpub();
 
-        if let OriginalWalletJson::Singlesig(ref mut m) = vss_wallets[0].original_wallet {
-            // Sanity: the legitimate xpub differs from the impostor.
-            assert_ne!(m.singlesig_xpub, bad_xpub);
-            m.singlesig_xpub = bad_xpub.clone();
-        } else {
-            panic!("expected singlesig variant");
-        }
+        // Sanity: the legitimate xpub differs from the impostor.
+        assert_ne!(vss_wallets[0].original_wallet.singlesig_xpub, bad_xpub);
+        vss_wallets[0].original_wallet.singlesig_xpub = bad_xpub.clone();
 
         // Drive `to_singlesig` directly with the known-good seed phrase.
         // We deliberately do NOT go through `combine_vss_wallets` here:
