@@ -1,27 +1,6 @@
-//! Secret sharing implementation using Pedersen Verifiable Secret Sharing (VSS).
+//! BIP-39 secret sharing with Pedersen VSS.
 //!
-//! This module implements **Pedersen VSS**, which is **Shamir's Secret Sharing with added
-//! verifiability**. While Shamir's scheme splits secrets into shares with threshold reconstruction,
-//! Pedersen VSS adds cryptographic commitments that allow anyone to verify shares are valid
-//! without learning anything about the secret.
-//!
-//! ## What is Pedersen VSS?
-//!
-//! Pedersen VSS = **Shamir's Secret Sharing** + **Pedersen Commitments** for verification
-//!
-//! - **Base scheme**: Shamir's polynomial secret sharing (M-of-N threshold)
-//! - **Enhancement**: Pedersen commitments provide verifiability
-//! - **Benefit**: Shares can be verified as authentic before they're needed
-//!
-//! ## Why VSS instead of plain Shamir?
-//!
-//! Traditional Shamir's Secret Sharing has a problem: you can't verify shares are valid until
-//! you try to reconstruct the secret. With Pedersen VSS, share holders can verify their shares
-//! are genuine at any time, which is crucial for inheritance/backup scenarios where shares
-//! may not be used for years.
-//!
-//! This module provides functionality to split BIP-39 mnemonic phrases into shares
-//! and reconstruct them using the Pedersen VSS scheme.
+//! See `docs/secret_sharing.md` for the user-facing model and security notes.
 
 use anyhow::{Context, Result, anyhow, bail};
 use bip39::Mnemonic;
@@ -55,9 +34,8 @@ impl VssRecovery {
     ///
     /// This is the **safe** entry point for reconstructing a wallet
     /// from a successful `combine_vss_wallets`: the duress decision
-    /// uses `self.metadata.is_duress`, which is *group-aggregated*
-    /// (any verified share asserting duress flips the recovery to
-    /// duress mode) — a single tampered share's `is_duress` byte
+    /// uses `self.metadata.is_duress`, which is a strict-majority
+    /// decision over the verified group — a single tampered share's `is_duress` byte
     /// cannot redirect a passphrase restore the way it could in the
     /// per-share `to_singlesig` path.
     ///
@@ -173,35 +151,9 @@ pub enum SecretSharingError {
     FileFormatError(String),
 }
 
-/// Internal representation of a single share of a split secret.
-///
-/// vsss-rs 5.x uses typed shares rather than the v4 raw byte format. The
-/// persisted `share_data` and `blinder_share_data` hex strings in this crate
-/// encode one typed Curve25519/Ristretto scalar share as
-/// `identifier || value`, where both fields are 32-byte canonical
-/// `WrappedScalar` encodings. The first byte is no longer the share
-/// identifier; all identifier reads must deserialize the typed identifier
-/// field before dedupe, verification, or metadata voting.
-///
-/// Entropy is split into two independent 16-byte halves and each half is shared
-/// via its own Pedersen VSS instance. 12-word mnemonics (16 bytes of entropy)
-/// only use the `_lo` half; 24-word mnemonics (32 bytes) use both. Splitting in
-/// half keeps every input < 2^128, well below the Curve25519 scalar order
-/// (~2^252.4), so `Scalar::from_bytes_mod_order` never actually reduces and the
-/// round-trip is exact.
-///
-/// `Zeroize`/`ZeroizeOnDrop` wipe the heap-resident hex strings (secret share,
-/// blinder share, both halves) when the `Share` is dropped, so plaintext share
-/// material doesn't linger in process memory after split / combine finishes.
-///
-/// This type is intentionally **crate-private**. The supported public API is
-/// `split_singlesig_wallet` + `combine_vss_wallets`, which thread these
-/// shares through the AEAD-authenticated `VssJsonWalletDescriptionV0` on
-/// disk; the AEAD MAC is what protects the share metadata (verifier sets,
-/// hi-half presence) from tampering. A bare `Share` outside that wrapper
-/// has no integrity check, so accepting one from an untrusted source would
-/// expose recovery to silent downgrade attacks (stripping `*_hi` fields,
-/// editing `verification_data`, …) that this crate cannot detect on its own.
+/// Internal share representation. The public on-disk format is the
+/// AEAD-authenticated `VssJsonWalletDescriptionV0`; bare `Share`s are only for
+/// split/combine internals and tests.
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct Share {
     /// Schema version for future compatibility
@@ -248,72 +200,7 @@ pub(crate) struct Share {
 
     /// ISO 8601 timestamp of share creation
     pub created_at: String,
-
-    /// BLAKE3 hash of share_data (and share_data_hi when present) for integrity checking
-    pub checksum: String,
 }
-
-impl Share {
-    /// Compute the canonical checksum over the share's secret/blinder data
-    /// AND the Pedersen verifier sets that drive recovery. All of these
-    /// streams are critical for correct reconstruction:
-    ///
-    ///   * share_data / share_data_hi: the secret-share polynomial points.
-    ///   * blinder_share_data / blinder_share_data_hi: paired blinder
-    ///     points used in Pedersen verify_share_and_blinder.
-    ///   * verification_data / verification_data_hi: the Pedersen
-    ///     commitments — the cryptographically authoritative description
-    ///     of the polynomial. A tampered verifier set would still let a
-    ///     plaintext share pass `verify_checksum()` if it were not
-    ///     hashed in here, even though combine would later reject every
-    ///     share for verifying against a fabricated polynomial.
-    ///
-    /// A single flipped bit in any of those streams must be caught at
-    /// `load_from_file` time, so the load contract matches what combine
-    /// will demand.
-    fn compute_checksum(&self) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.share_data.as_bytes());
-        hasher.update(b"|");
-        hasher.update(self.blinder_share_data.as_bytes());
-        hasher.update(b"|");
-        hasher.update(self.verification_data.as_bytes());
-        if let Some(hi) = &self.share_data_hi {
-            hasher.update(b"|");
-            hasher.update(hi.as_bytes());
-        }
-        if let Some(hi) = &self.blinder_share_data_hi {
-            hasher.update(b"|");
-            hasher.update(hi.as_bytes());
-        }
-        if let Some(hi) = &self.verification_data_hi {
-            hasher.update(b"|");
-            hasher.update(hi.as_bytes());
-        }
-        hex::encode(hasher.finalize().as_bytes())
-    }
-
-    /// Verify the integrity of this share using its checksum.
-    /// Only used by tests now (the real on-disk format is the AEAD-
-    /// authenticated `VssJsonWalletDescriptionV0`).
-    #[cfg(test)]
-    pub(crate) fn verify_checksum(&self) -> Result<()> {
-        if self.compute_checksum() != self.checksum {
-            bail!(SecretSharingError::VerificationFailed);
-        }
-        Ok(())
-    }
-}
-
-// `Share::save_to_file` / `load_from_file` were intentionally removed:
-// the only on-disk integrity check available there was an *unkeyed*
-// BLAKE3 checksum that anyone editing the JSON could trivially
-// recompute, so the format was tamperable rather than tamper-evident
-// (e.g. stripping every `*_hi` field would silently downgrade a
-// 24-word recovery to a different valid 12-word one). The supported
-// share-file format in this crate is the password-encrypted
-// `VssJsonWalletDescriptionV0` written by the `split-secret` CLI;
-// authenticity for those files is provided by the AEAD wrapper.
 
 /// Pack a 16-byte entropy half into a Curve25519 scalar.
 ///
@@ -395,6 +282,36 @@ fn verify_vsss_share_pair(
         .is_ok()
 }
 
+fn wallet_verifies_against_candidate(
+    wallet: &crate::wallet_description::VssJsonWalletDescriptionV0,
+    lo_set: &Vec<VsssVerifier>,
+    hi_set: Option<&Vec<VsssVerifier>>,
+) -> bool {
+    let (Ok(lo_secret), Ok(lo_blinder)) = (
+        hex::decode(&wallet.share_data),
+        hex::decode(&wallet.blinder_share_data),
+    ) else {
+        return false;
+    };
+    if !verify_vsss_share_pair(lo_set, &lo_secret, &lo_blinder) {
+        return false;
+    }
+    let Some(hi_set) = hi_set else {
+        return true;
+    };
+    let (Some(hi_secret_hex), Some(hi_blinder_hex)) = (
+        wallet.share_data_hi.as_deref(),
+        wallet.blinder_share_data_hi.as_deref(),
+    ) else {
+        return false;
+    };
+    let (Ok(hi_secret), Ok(hi_blinder)) = (hex::decode(hi_secret_hex), hex::decode(hi_blinder_hex))
+    else {
+        return false;
+    };
+    verify_vsss_share_pair(hi_set, &hi_secret, &hi_blinder)
+}
+
 /// Reassemble entropy halves into a mnemonic of the requested word count.
 fn entropy_to_mnemonic(
     lo: &[u8; 16],
@@ -421,34 +338,13 @@ fn entropy_to_mnemonic(
     Ok(SecretBox::new(Box::new(mnemonic)))
 }
 
-/// Split a BIP-39 mnemonic into shares using Pedersen VSS (enhanced Shamir's Secret Sharing)
-///
-/// This uses **Shamir's polynomial secret sharing** as the base algorithm, enhanced with
-/// **Pedersen commitments** for verifiability. The core splitting/reconstruction follows
-/// Shamir's 1979 scheme, but adds the ability to verify shares without revealing the secret.
-///
-/// # Arguments
-/// * `mnemonic` - The mnemonic phrase to split
-/// * `threshold` - Minimum number of shares needed to reconstruct (M in M-of-N, from Shamir)
-/// * `total_shares` - Total number of shares to create (N in M-of-N, from Shamir)
-/// * `rng` - A cryptographically secure random number generator
-///
-/// # Returns
-/// A vector of `Share` structs containing the split secret and verification data
-///
-/// # Security Notes
-/// - Uses Shamir's polynomial interpolation for threshold reconstruction
-/// - Adds Pedersen commitments for verifiable secret sharing
-/// - All intermediate values are zeroized after use
-/// - Shares can be verified without revealing information about the secret
-/// - Information-theoretic security: M-1 shares reveal nothing (from Shamir's scheme)
+/// Split a BIP-39 mnemonic into Pedersen VSS shares.
 pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     mnemonic: &Mnemonic,
     threshold: u8,
     total_shares: u8,
     rng: &mut R,
 ) -> Result<Vec<Share>> {
-    // Validate parameters
     if threshold < 2 || total_shares < 2 {
         bail!(SecretSharingError::InvalidShareCount);
     }
@@ -465,11 +361,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
         bail!(SecretSharingError::InvalidMnemonicLength);
     }
 
-    // BIP-39: 12 words → 16 bytes of entropy, 24 words → 32 bytes.
-    // `mnemonic.to_entropy()` returns a plain `Vec<u8>` whose backing heap
-    // buffer is not zeroized on drop, so wrap it in `SecretBox` to clear it
-    // when this scope exits — otherwise the raw seed lingers in memory until
-    // the allocator happens to reuse those bytes.
+    // Keep the raw BIP-39 entropy in zeroizing storage while splitting.
     let entropy = SecretBox::new(Box::new(mnemonic.to_entropy()));
     let entropy_bytes = entropy.expose_secret();
     let lo_scalar = entropy_half_to_scalar(&entropy_bytes[..16]);
@@ -497,7 +389,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
             .map(|h| hex::encode(&h.blinder_bytes[idx]));
         let verification_data_hi = hi_split.as_ref().map(|h| h.verification_data.clone());
 
-        let mut share = Share {
+        shares.push(Share {
             version: 1,
             scheme: "pedersen".to_string(),
             share_index: (idx + 1) as u8,
@@ -511,10 +403,7 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
             blinder_share_data_hi,
             verification_data_hi,
             created_at: timestamp.clone(),
-            checksum: String::new(),
-        };
-        share.checksum = share.compute_checksum();
-        shares.push(share);
+        });
     }
 
     Ok(shares)
@@ -522,20 +411,8 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
 
 /// Result of splitting a single scalar via Pedersen VSS.
 struct VssOneScalar {
-    /// Per-share secret-share raw bytes (length == total_shares).
     share_bytes: Vec<Vec<u8>>,
-    /// Per-share blinder-share raw bytes (length == total_shares; index `i`
-    /// pairs with `share_bytes[i]`).
     blinder_bytes: Vec<Vec<u8>>,
-    /// Hex-encoded, comma-separated Pedersen verifier set:
-    /// `[g, h, C_0, C_1, ..., C_{t-1}]`. Combine uses this together with
-    /// each (secret_share, blinder_share) pair to verify shares without
-    /// learning anything about the secret — `C_i = g^a_i * h^b_i` blinds
-    /// `a_i` (in particular `a_0 = secret`) with the random `b_i`, so even
-    /// when the secret is restricted to a small range (here 128 bits) the
-    /// commitment does not leak it (in contrast to a Feldman commitment
-    /// `g^a_i`, which would be vulnerable to a ~2^64 discrete-log attack
-    /// for a 128-bit exponent).
     verification_data: String,
 }
 
@@ -604,20 +481,7 @@ fn parse_ristretto_points(s: &str) -> Result<Vec<VsssVerifier>> {
     Ok(out)
 }
 
-/// Filter (secret_share, blinder_share) pairs down to those that pass
-/// Pedersen verification, deduped by typed share identifier.
-///
-/// Pedersen `verify_share_and_blinder` checks that the Pedersen commitment
-/// `C(x_i) = g^a(x_i) * h^b(x_i)` equals the value implied by the share's
-/// `(secret_share, blinder_share)` at the share's identifier. This proves
-/// the share lies on both the secret and blinder polynomials without
-/// revealing either value — in particular the secret remains hidden by the
-/// random blinder even when it is restricted to a small range.
-///
-/// Combining requires distinct identifiers, and any two share-pairs with
-/// the same identifier that both verify are guaranteed to be byte-identical
-/// (a polynomial can take only one value at any given x), so first-wins
-/// dedupe is safe.
+/// Verify share/blinder pairs and dedupe by typed share identifier.
 fn verified_unique_share_pairs(
     secret_shares: &[Vec<u8>],
     blinder_shares: &[Vec<u8>],
@@ -686,33 +550,15 @@ fn verified_unique_share_pairs(
     Ok(out)
 }
 
-/// Combine shares to reconstruct the original mnemonic
-///
-/// # Arguments
-/// * `shares` - A slice of `Share` structs (must have at least threshold shares)
-///
-/// # Returns
-/// The reconstructed mnemonic phrase in a `SecretBox` for automatic zeroization
-///
-/// # Security Notes
-/// - Verifies all shares using Pedersen commitments before reconstruction
-/// - Validates the reconstructed mnemonic has a valid BIP-39 checksum
-/// - All intermediate values are zeroized after use
+/// Combine `Share`s to reconstruct the original mnemonic.
+#[cfg(test)]
 pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<Mnemonic>> {
     if shares.is_empty() {
         bail!(anyhow!("No shares provided"));
     }
 
-    // Group input shares by their cryptographic identity — the Pedersen
-    // verifier sets uniquely identify a single split run. The largest
-    // group is the candidate for reconstruction; smaller groups
-    // (typically a single corrupted-verifier outlier) are dropped.
-    //
-    // This deliberately does NOT use `shares[0]` as the canonical
-    // "first" share for compatibility checks — otherwise a corrupted
-    // first-position share would abort recovery even when the remaining
-    // shares form a valid threshold set. Recovery should depend only on
-    // whether a viable subset exists, not on input order.
+    // Group by Pedersen verifier identity; input order must not choose the
+    // canonical share when verifier-copy corruption is present.
     type GroupKey<'a> = (&'a str, Option<&'a str>);
     let mut groups: std::collections::BTreeMap<GroupKey, Vec<&Share>> =
         std::collections::BTreeMap::new();
@@ -723,46 +569,20 @@ pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<M
         );
         groups.entry(key).or_default().push(s);
     }
-    // Pick the largest group (ties broken arbitrarily — within a single
-    // call this just affects which set of shares is attempted; the next
-    // step verifies and combines them).
+    // Try the largest verifier group first; verification still decides safety.
     let chosen: Vec<&Share> = groups
         .into_values()
         .max_by_key(|g| g.len())
         .expect("non-empty input ⇒ at least one group");
     let first = chosen[0];
 
-    // Other fields (`version`, `mnemonic_length`,
-    // `share_data_hi.is_some()` consistency, `blinder_share_data_hi.is_some()`
-    // consistency) are advisory metadata. A single share with a flipped
-    // advisory field should NOT abort recovery for the whole group when
-    // the remaining shares still satisfy the threshold — combine_one_half
-    // skips individual broken shares per-half and the threshold check at
-    // the end catches the case where too many were skipped.
-
-    // Derive whether to reconstruct one half (12-word) or two (24-word)
-    // from the *cryptographic* presence of the high-half verifier set,
-    // not from the mutable `mnemonic_length` JSON field. Otherwise an
-    // attacker who edits the metadata field down from 24 to 12 across
-    // every share could trick combine into ignoring the high-half
-    // share data and silently returning a different valid 12-word
-    // mnemonic.
+    // Derive 12-vs-24 from the verifier set, not mutable JSON metadata.
     let has_hi = first.verification_data_hi.is_some();
     let derived_word_count: usize = if has_hi { 24 } else { 12 };
 
-    // The reconstruction threshold is derived from the Pedersen verifier set
-    // (commitment data, not metadata). This is the cryptographically
-    // authoritative threshold — the `Share.threshold` field is informational
-    // only. Trusting only the verifier set here defeats a "downgrade"
-    // attack (where an attacker rewrites `threshold` down across all
-    // shares hoping that combine accepts fewer points than the polynomial
-    // actually requires), because Lagrange interpolation will still demand
-    // the real number of points and per-share Pedersen verification will
-    // still reject any share that doesn't lie on the original polynomial.
+    // Derive threshold from commitments; `Share.threshold` is advisory.
     let lo_threshold = threshold_from_pedersen(&first.verification_data)?;
 
-    // Check we have enough shares (using the cryptographic threshold) —
-    // count shares in the chosen group, not the full input slice.
     if chosen.len() < lo_threshold as usize {
         bail!(SecretSharingError::InsufficientShares {
             threshold: lo_threshold,
@@ -805,11 +625,7 @@ pub(crate) fn combine_shares_to_mnemonic(shares: &[Share]) -> Result<SecretBox<M
 
     let mnemonic = entropy_to_mnemonic(&lo_bytes, hi_bytes.as_ref(), derived_word_count)?;
 
-    // Advisory: surface a tampered `mnemonic_length` field. The recovery
-    // already used the cryptographically authoritative value derived from
-    // the verifier set, so the secret returned is correct; this just
-    // tells the caller that the share metadata disagreed with the
-    // commitments and may have been edited.
+    // Advisory only: recovery already used the verifier-derived length.
     if first.mnemonic_length != derived_word_count {
         log::warn!(
             "Share metadata says mnemonic_length={} but Pedersen verifier set implies {}; \
@@ -835,30 +651,17 @@ fn threshold_from_pedersen(pedersen_hex: &str) -> Result<u8> {
     u8::try_from(t).context("Pedersen verifier set encodes a threshold that does not fit in u8")
 }
 
-/// Combine the per-share secret/blinder hex pairs selected by `extract_*`
-/// into a single scalar.
-///
-/// Per-share tolerance is the rule here: any individual share is dropped
-/// (rather than aborting the whole combine) if it lacks the hex slot for
-/// this half, has malformed hex, or fails Pedersen verification. The
-/// `verified_unique_share_pairs` step then dedupes by share identifier
-/// and the threshold check below catches the case where too many shares
-/// were dropped.
-fn combine_one_half(
-    shares: &[&Share],
-    extract_secret: impl Fn(&Share) -> Option<&str>,
-    extract_blinder: impl Fn(&Share) -> Option<&str>,
+/// Combine one entropy half, dropping malformed or unverifiable shares.
+fn combine_one_half<T>(
+    shares: &[&T],
+    extract_secret: impl Fn(&T) -> Option<&str>,
+    extract_blinder: impl Fn(&T) -> Option<&str>,
     pedersen_hex: &str,
     threshold: u8,
 ) -> Result<Option<WrappedScalar>> {
     let mut secret_bytes: Vec<Vec<u8>> = Vec::with_capacity(shares.len());
     let mut blinder_bytes: Vec<Vec<u8>> = Vec::with_capacity(shares.len());
     for share in shares {
-        // Skip shares that don't carry both halves' hex data, or whose
-        // hex is malformed. Verified `verified_unique_share_pairs` will
-        // confirm cryptographic validity; until then we only filter
-        // structural defects so a single bad share doesn't block recovery
-        // for an otherwise complete set.
         let (Some(s_hex), Some(b_hex)) = (extract_secret(share), extract_blinder(share)) else {
             continue;
         };
@@ -883,16 +686,49 @@ fn combine_one_half(
     Ok(Some(combined.0))
 }
 
-/// Split a singlesig wallet into VSS shares
-///
-/// # Arguments
-/// * `wallet` - The singlesig wallet to split
-/// * `threshold` - Minimum number of shares needed to reconstruct (M in M-of-N)
-/// * `total_shares` - Total number of shares to create (N in M-of-N)
-/// * `rng` - A cryptographically secure random number generator
-///
-/// # Returns
-/// A vector of `VssJsonWalletDescriptionV0` structs, each containing a share and the wallet metadata
+fn combine_wallet_candidate_to_mnemonic(
+    wallets: &[&crate::wallet_description::VssJsonWalletDescriptionV0],
+    lo_pedersen: &str,
+    hi_pedersen: Option<&str>,
+    threshold: u8,
+) -> Result<SecretBox<Mnemonic>> {
+    let lo_scalar = combine_one_half(
+        wallets,
+        |w| Some(w.share_data.as_str()),
+        |w| Some(w.blinder_share_data.as_str()),
+        lo_pedersen,
+        threshold,
+    )?
+    .ok_or_else(|| anyhow!("missing low-half share data"))?;
+    let lo_bytes = scalar_to_entropy_half(&lo_scalar);
+
+    let hi_bytes = if let Some(hi_pedersen) = hi_pedersen {
+        let hi_threshold = threshold_from_pedersen(hi_pedersen)?;
+        anyhow::ensure!(
+            hi_threshold == threshold,
+            "Low-half and high-half Pedersen verifier sets imply different thresholds ({threshold} vs {hi_threshold})"
+        );
+        let hi_scalar = combine_one_half(
+            wallets,
+            |w| w.share_data_hi.as_deref(),
+            |w| w.blinder_share_data_hi.as_deref(),
+            hi_pedersen,
+            hi_threshold,
+        )?
+        .ok_or_else(|| anyhow!("missing high-half share data"))?;
+        Some(scalar_to_entropy_half(&hi_scalar))
+    } else {
+        None
+    };
+
+    entropy_to_mnemonic(
+        &lo_bytes,
+        hi_bytes.as_ref(),
+        if hi_pedersen.is_some() { 24 } else { 12 },
+    )
+}
+
+/// Split a singlesig wallet into encrypted-wallet-compatible VSS share payloads.
 pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     wallet: &crate::wallet_description::SinglesigJsonWalletDescriptionV0,
     threshold: u8,
@@ -902,25 +738,11 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
 ) -> Result<Vec<crate::wallet_description::VssJsonWalletDescriptionV0>> {
     use std::sync::Arc;
 
-    // Parse the mnemonic from the wallet
     let mnemonic =
         Mnemonic::parse(&wallet.seed_phrase).context("Failed to parse mnemonic from wallet")?;
 
-    // Refuse to embed metadata derived from a non-default BIP-39
-    // passphrase. The recovery path
-    // (`combine_vss_wallets` → `rebuild_singlesig(&None, ..)` /
-    //  `to_singlesig`) authenticates the share metadata against the
-    // *no-passphrase* derivation of the recovered seed, so a
-    // passphrase-derived xpub baked into the shares would either:
-    //   - render the share set unrecoverable (xpub mismatch on the
-    //     authentication step), or
-    //   - if `is_duress` is set, leak the hidden wallet's identity
-    //     into every share file (defeating plausible deniability —
-    //     an attacker who decrypted one share would see the real
-    //     wallet's xpub and first address instead of the decoy's).
-    // The CLI avoids both by always passing the no-passphrase /
-    // decoy wallet, but the public core API must enforce the same
-    // invariant for callers that bypass the CLI.
+    // Recovery authenticates against the no-passphrase xpub; refuse shares
+    // whose metadata would be unrecoverable or leak duress identity.
     {
         let secp_check = crate::random_generation_utils::get_secp(rng);
         let network = bitcoin::Network::from_str(&wallet.network)
@@ -952,16 +774,9 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
         );
     }
 
-    // Split the mnemonic into shares
     let shares = split_mnemonic(&mnemonic, threshold, total_shares, rng)?;
 
-    // Convert each share to a VssJsonWalletDescriptionV0 carrying only public
-    // metadata about the wallet — the seed phrase and xprivs are NOT embedded.
-    // `Share` derives `ZeroizeOnDrop` (so its hex-encoded secret/blinder
-    // strings get wiped from the heap when this scope ends) which means
-    // we can't move the fields out — clone them into the VSS wallet
-    // wrapper instead. Cloning the hex strings is cheap; the original
-    // `Share` is dropped (and zeroized) at the end of the iteration.
+    // The VSS wrapper carries public metadata only; seed phrase and xprivs stay out.
     let mut vss_wallets = Vec::with_capacity(shares.len());
     for share in &shares {
         let mnemonic_length =
@@ -987,19 +802,7 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     Ok(vss_wallets)
 }
 
-/// Combine VSS wallet shares to reconstruct the original wallet
-///
-/// # Arguments
-/// * `vss_wallets` - A slice of `VssJsonWalletDescriptionV0` (must have at least threshold shares)
-///
-/// # Returns
-/// A `VssRecovery` containing the reconstructed mnemonic plus the chosen
-/// group's metadata (so callers can surface, e.g., a duress-mode warning).
-///
-/// # Security Notes
-/// - Verifies all shares using Pedersen commitments before reconstruction
-/// - Validates the reconstructed mnemonic has a valid BIP-39 checksum
-/// - All intermediate values are zeroized after use
+/// Combine VSS wallet shares into a mnemonic plus authenticated public metadata.
 pub fn combine_vss_wallets(
     vss_wallets: &[crate::wallet_description::VssJsonWalletDescriptionV0],
 ) -> Result<VssRecovery> {
@@ -1007,41 +810,12 @@ pub fn combine_vss_wallets(
         bail!(anyhow!("No VSS wallets provided"));
     }
 
-    // We deliberately do NOT filter out shares whose `wallet_type`
-    // metadata says "multisig". That tag is mutable JSON; an attacker
-    // (or just a corrupted byte) editing it on an otherwise valid
-    // share would, with a prefilter, turn a metadata-only problem
-    // into a hard recovery failure on exact-threshold inputs (e.g.
-    // 2-of-2). The cryptographic recovery only consumes
-    // `share_data`/`blinder_share_data`/`verification_data`, all of
-    // which exist on every share regardless of wallet_type, so let the
-    // grouping + per-share Pedersen verification decide. Downstream
-    // metadata derivation (`derive_metadata`) already handles a
-    // Multisig variant by falling back to defaults — but we never
-    // discard the share's secret bytes for it.
+    // Do not prefilter mutable wallet_type metadata; Pedersen verification
+    // decides which secret bytes belong to the candidate.
     let vss_wallets_owned: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
         vss_wallets.iter().collect();
     let vss_wallets: &[&crate::wallet_description::VssJsonWalletDescriptionV0] = &vss_wallets_owned;
 
-    // Iterate verifier *candidates* — pairs of (lo_verifier_hex,
-    // optional hi_verifier_hex) found in the input — instead of
-    // grouping shares by their declared verifier strings. Verifying
-    // every input share's secret/blinder against the candidate
-    // verifier (rather than the share's own copy) means that a
-    // share whose `verification_data` was corrupted but whose
-    // `share_data` is still valid for the real polynomial gets picked
-    // up by the candidate carrying the real verifier. Without this,
-    // an exact-threshold recovery (e.g. 3-of-3) would be lost when
-    // any single share's verifier copy was bit-flipped, even though
-    // the cryptographic shares themselves were intact.
-    //
-    // For each candidate verifier pair, we then re-clone the input
-    // shares, overwrite their `verification_data*` with the candidate
-    // verifier, and pass them through `combine_shares_to_mnemonic`.
-    // The internal Pedersen check inside that function will drop any
-    // share whose secret/blinder bytes don't lie on the candidate
-    // polynomial, so unrelated splits in the same input get filtered
-    // per candidate.
     type CandidateVerifier<'a> = (&'a str, Option<&'a str>);
     // Enumerate the *cross product* of distinct lo verifiers and
     // distinct hi verifiers (plus `None` for hi, which models a
@@ -1134,7 +908,7 @@ pub fn combine_vss_wallets(
     let mut last_err: Option<anyhow::Error> = None;
     let mut tried = 0usize;
     for candidate in &candidates {
-        let (lo_hex, hi_hex_opt) = candidate;
+        let &(lo_hex, hi_hex_opt) = candidate;
         let candidate_threshold = match threshold_from_pedersen(lo_hex) {
             Ok(t) => t,
             Err(e) => {
@@ -1147,80 +921,23 @@ pub fn combine_vss_wallets(
         }
         tried += 1;
 
-        // Build Share structs that pretend each input share carries
-        // the candidate verifier. The internal verification will then
-        // drop those whose secret/blinder bytes don't lie on the
-        // candidate polynomial.
-        let mut shares = Vec::with_capacity(vss_wallets.len());
-        for wallet in vss_wallets {
-            let mut share = Share {
-                version: wallet.version,
-                scheme: "pedersen".to_string(),
-                share_index: wallet.share_index,
-                threshold: wallet.threshold,
-                total_shares: wallet.total_shares,
-                mnemonic_length: wallet.mnemonic_length as usize,
-                share_data: wallet.share_data.clone(),
-                blinder_share_data: wallet.blinder_share_data.clone(),
-                verification_data: lo_hex.to_string(),
-                share_data_hi: wallet.share_data_hi.clone(),
-                blinder_share_data_hi: wallet.blinder_share_data_hi.clone(),
-                verification_data_hi: hi_hex_opt.map(|s| s.to_string()),
-                created_at: wallet.created_at.clone(),
-                checksum: String::new(),
-            };
-            share.checksum = share.compute_checksum();
-            shares.push(share);
-        }
-        match combine_shares_to_mnemonic(&shares) {
+        match combine_wallet_candidate_to_mnemonic(
+            vss_wallets,
+            lo_hex,
+            hi_hex_opt,
+            candidate_threshold,
+        ) {
             Ok(secret) => {
-                // Capture which input shares actually verified against
-                // this candidate verifier, for downstream metadata
-                // derivation. (combine_shares_to_mnemonic already did
-                // the verification, but we need the raw input wallets,
-                // not the cloned Shares, to derive the public
-                // metadata / xpub etc.)
                 let lo_set = parse_ristretto_points(lo_hex).ok();
                 let hi_set = hi_hex_opt.and_then(|h| parse_ristretto_points(h).ok());
-                let verifies_lo =
-                    |w: &crate::wallet_description::VssJsonWalletDescriptionV0| -> bool {
-                        let set = match &lo_set {
-                            Some(s) => s,
-                            None => return false,
-                        };
-                        let Ok(sb) = hex::decode(&w.share_data) else {
-                            return false;
-                        };
-                        let Ok(bb) = hex::decode(&w.blinder_share_data) else {
-                            return false;
-                        };
-                        verify_vsss_share_pair(set, &sb, &bb)
-                    };
-                let verifies_hi =
-                    |w: &crate::wallet_description::VssJsonWalletDescriptionV0| -> bool {
-                        let set = match &hi_set {
-                            Some(s) => s,
-                            None => return true, // 12-word: no hi half ⇒ vacuously OK
-                        };
-                        let (Some(s), Some(b)) = (
-                            w.share_data_hi.as_deref(),
-                            w.blinder_share_data_hi.as_deref(),
-                        ) else {
-                            return false;
-                        };
-                        let Ok(sb) = hex::decode(s) else {
-                            return false;
-                        };
-                        let Ok(bb) = hex::decode(b) else {
-                            return false;
-                        };
-                        verify_vsss_share_pair(set, &sb, &bb)
-                    };
                 let verified_inputs: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
                     vss_wallets
                         .iter()
                         .copied()
-                        .filter(|w| verifies_lo(w) && verifies_hi(w))
+                        .filter(|w| match &lo_set {
+                            Some(lo) => wallet_verifies_against_candidate(w, lo, hi_set.as_ref()),
+                            None => false,
+                        })
                         .collect();
                 let complete_verified_ids: std::collections::HashSet<VsssScalar> = verified_inputs
                     .iter()
@@ -1257,44 +974,14 @@ pub fn combine_vss_wallets(
         // one whose verifier copy was corrupted.
         let verifier_lo = parse_ristretto_points(lo_pedersen).ok();
         let verifier_hi = hi_pedersen.and_then(|hex| parse_ristretto_points(hex).ok());
-        let share_passes = |w: &crate::wallet_description::VssJsonWalletDescriptionV0| -> bool {
-            let lo_set = match &verifier_lo {
-                Some(v) => v,
-                None => return false,
-            };
-            let lo_bytes = match hex::decode(&w.share_data) {
-                Ok(b) => b,
-                Err(_) => return false,
-            };
-            let lo_blinder = match hex::decode(&w.blinder_share_data) {
-                Ok(b) => b,
-                Err(_) => return false,
-            };
-            if !verify_vsss_share_pair(lo_set, &lo_bytes, &lo_blinder) {
-                return false;
-            }
-            if let Some(hi_set) = &verifier_hi {
-                let (hi_bytes_hex, hi_blinder_hex) =
-                    match (&w.share_data_hi, &w.blinder_share_data_hi) {
-                        (Some(s), Some(b)) => (s, b),
-                        _ => return false,
-                    };
-                let hi_bytes = match hex::decode(hi_bytes_hex) {
-                    Ok(b) => b,
-                    Err(_) => return false,
-                };
-                let hi_blinder = match hex::decode(hi_blinder_hex) {
-                    Ok(b) => b,
-                    Err(_) => return false,
-                };
-                if !verify_vsss_share_pair(hi_set, &hi_bytes, &hi_blinder) {
-                    return false;
-                }
-            }
-            true
-        };
-        let verified: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> =
-            group.iter().copied().filter(|w| share_passes(w)).collect();
+        let verified: Vec<&crate::wallet_description::VssJsonWalletDescriptionV0> = group
+            .iter()
+            .copied()
+            .filter(|w| match &verifier_lo {
+                Some(lo) => wallet_verifies_against_candidate(w, lo, verifier_hi.as_ref()),
+                None => false,
+            })
+            .collect();
         // Dedupe by the **cryptographic** typed share identifier — NOT
         // the mutable `share_index` JSON field. Within each id's bucket
         // the share-data bytes
@@ -1340,8 +1027,8 @@ pub fn combine_vss_wallets(
             return crate::wallet_description::SinglesigPublicMetadataV0::default();
         }
         let tally_source: &[&crate::wallet_description::VssJsonWalletDescriptionV0] = &deduped;
-        // Exclude `is_duress` from the metadata vote — it's aggregated
-        // separately (below) as "any-share-duress wins". Otherwise a
+        // Exclude `is_duress` from the metadata vote; it is aggregated
+        // separately below. Otherwise a
         // single-bit `is_duress` flip on one share would tie the vote
         // (1 vs 1 in exact-threshold recovery), the strict-majority
         // guard would fall back to default metadata, and
@@ -1685,34 +1372,6 @@ mod tests {
 
         let result = split_mnemonic(&mnemonic, 5, 3, &mut rng);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_share_checksum_verification() {
-        let mnemonic = Mnemonic::parse("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
-        let mut rng = rand::thread_rng();
-
-        let shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
-
-        // Verify checksum on a fresh share
-        assert!(shares[0].verify_checksum().is_ok());
-
-        // The checksum must cover EVERY field that is critical for
-        // reconstruction: secret share data, blinder share data, and the
-        // Pedersen verifier set. A single byte flipped in any of these
-        // must be caught at load time.
-        for tamper in [
-            |s: &mut Share| s.share_data = "deadbeef".to_string(),
-            |s: &mut Share| s.blinder_share_data = "deadbeef".to_string(),
-            |s: &mut Share| s.verification_data = "deadbeef,deadbeef,deadbeef,deadbeef".to_string(),
-        ] {
-            let mut corrupted = shares[0].clone();
-            tamper(&mut corrupted);
-            assert!(
-                corrupted.verify_checksum().is_err(),
-                "checksum did not catch a tamper that should have been authenticated"
-            );
-        }
     }
 
     #[test]
@@ -2715,7 +2374,6 @@ mod tests {
             *b ^= 0xAA;
         }
         shares[0].share_data = hex::encode(&bytes);
-        shares[0].checksum = shares[0].compute_checksum();
 
         let err = match combine_shares_to_mnemonic(&shares[0..2]) {
             Ok(_) => panic!("expected combine to reject the tampered share"),
@@ -2860,7 +2518,6 @@ mod tests {
         let mut shares = split_mnemonic(&mnemonic, 3, 5, &mut rng).unwrap();
         for share in shares.iter_mut() {
             share.threshold = 2; // downgrade across the board
-            share.checksum = share.compute_checksum();
         }
 
         // 2 shares: must still fail because the Pedersen threshold is 3.
@@ -2897,7 +2554,6 @@ mod tests {
             // Tamper: rewrite the metadata across all shares.
             for s in &mut shares {
                 s.mnemonic_length = 12;
-                s.checksum = s.compute_checksum();
             }
 
             let recovered = combine_shares_to_mnemonic(&shares[0..3]).unwrap();
@@ -2923,7 +2579,6 @@ mod tests {
         // form a 2-share group that meets threshold.
         let mut shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
         shares[0].verification_data = "deadbeef,deadbeef,deadbeef,deadbeef".to_string();
-        shares[0].checksum = shares[0].compute_checksum();
 
         let recovered = combine_shares_to_mnemonic(&shares).unwrap();
         assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string());
@@ -3000,7 +2655,6 @@ mod tests {
             *b ^= 0xAA;
         }
         shares[0].share_data = hex::encode(&bytes);
-        shares[0].checksum = shares[0].compute_checksum();
 
         let recovered = combine_shares_to_mnemonic(&shares).unwrap();
         assert_eq!(recovered.expose_secret().to_string(), mnemonic.to_string());
