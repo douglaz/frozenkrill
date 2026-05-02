@@ -2,7 +2,7 @@
   "active_run": {
     "run_id": "run-20260502013456",
     "stage_cursor": {
-      "stage": "plan_and_implement",
+      "stage": "final_review",
       "cycle": 1,
       "attempt": 1,
       "completion_round": 2
@@ -23,23 +23,10 @@
     "rollback_count": 0
   },
   "amendment_queue": {
-    "pending": [
-      {
-        "amendment_id": "fr-1-aa5e9948",
-        "source_stage": "final_review",
-        "source_cycle": 1,
-        "source_completion_round": 1,
-        "body": "frozenkrill-core/src/secret_sharing.rs:365-378: `verify_vsss_share_pair` parses the secret and blinder shares and then calls `verify_share_and_blinder` without first checking that their typed identifiers match. The stricter combine path does reject mismatches in `verified_unique_share_pairs` at frozenkrill-core/src/secret_sharing.rs:640-648, but this helper is used for `verified_inputs` and metadata voting at frozenkrill-core/src/secret_sharing.rs:1180, 1200, 1247, and 1264. Because the vsss verifier evaluates with the secret share's identifier, a structurally invalid pair with a tampered blinder identifier can be treated as verified for metadata even though it would not contribute to reconstruction. Mirror the identifier equality check in `verify_vsss_share_pair` before calling `verify_share_and_blinder`.",
-        "created_at": "2026-05-02T02:10:51.151982685Z",
-        "batch_sequence": 1,
-        "source": "workflow_stage",
-        "dedup_key": "9a354691c426bc86240f25dec1731582a93a1425d0d7daaebb47869293608fbd",
-        "classification": "fix_current_bead"
-      }
-    ],
-    "processed_count": 0
+    "pending": [],
+    "processed_count": 1
   },
-  "status_summary": "running: final review restart round 2 -> Plan and Implement",
+  "status_summary": "running: completed Plan and Implement, next Final Review",
   "last_stage_resolution_snapshot": {
     "stage_id": "final_review",
     "resolved_at": "2026-05-02T01:51:40.163053280Z",

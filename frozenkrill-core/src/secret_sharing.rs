@@ -373,6 +373,9 @@ fn verify_vsss_share_pair(
     let Ok(blinder_share) = vsss_share_from_bytes(blinder_bytes) else {
         return false;
     };
+    if secret_share.identifier() != blinder_share.identifier() {
+        return false;
+    }
     verifier_set
         .verify_share_and_blinder(&secret_share, &blinder_share)
         .is_ok()
@@ -1687,6 +1690,40 @@ mod tests {
                 "checksum did not catch a tamper that should have been authenticated"
             );
         }
+    }
+
+    #[test]
+    fn test_verify_vsss_share_pair_rejects_mismatched_blinder_identifier() {
+        let mnemonic = Mnemonic::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap();
+        let mut rng = rand::thread_rng();
+
+        let shares = split_mnemonic(&mnemonic, 2, 3, &mut rng).unwrap();
+        let verifier_set = parse_ristretto_points(&shares[0].verification_data).unwrap();
+        let secret_bytes = hex::decode(&shares[0].share_data).unwrap();
+        let mut blinder_bytes = hex::decode(&shares[0].blinder_share_data).unwrap();
+        let other_blinder_bytes = hex::decode(&shares[1].blinder_share_data).unwrap();
+
+        assert!(verify_vsss_share_pair(
+            &verifier_set,
+            &secret_bytes,
+            &blinder_bytes
+        ));
+
+        // vsss-rs 5 shares are `identifier || value`. Keep the blinder
+        // value valid for share[0], but replace only its typed identifier
+        // with share[1]'s identifier. Pedersen verification evaluates at
+        // the secret share's identifier, so the helper must reject the
+        // pair before calling into vsss-rs.
+        blinder_bytes[..32].copy_from_slice(&other_blinder_bytes[..32]);
+        assert_ne!(&secret_bytes[..32], &blinder_bytes[..32]);
+        assert!(!verify_vsss_share_pair(
+            &verifier_set,
+            &secret_bytes,
+            &blinder_bytes
+        ));
     }
 
     /// Property test: 100 random 24-word mnemonics must each round-trip
