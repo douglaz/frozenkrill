@@ -8,7 +8,6 @@ license = "MIT OR Apache-2.0"
 alkali = "0.3"
 libsodium-sys-stable = "1.22.3"
 anyhow = { version = "1", features = ["backtrace"] }
-base64 = "0.22"
 bip39 = { git = "https://github.com/rust-bitcoin/rust-bip39", features = [
     "rand",
     "zeroize",

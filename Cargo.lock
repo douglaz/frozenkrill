@@ -1221,7 +1221,6 @@ dependencies = [
  "alkali",
  "anyhow",
  "argon2",
- "base64 0.22.1",
  "bip39",
  "bitcoin",
  "blake3",
