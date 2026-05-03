@@ -289,7 +289,6 @@ fn entropy_to_mnemonic(
     Ok(SecretBox::new(Box::new(mnemonic)))
 }
 
-/// Split a BIP-39 mnemonic into Pedersen VSS shares.
 pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     mnemonic: &Mnemonic,
     threshold: u8,
@@ -313,7 +312,6 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     }
     let mnemonic_length = u8::try_from(word_count).context("mnemonic length does not fit in u8")?;
 
-    // Keep the raw BIP-39 entropy in zeroizing storage while splitting.
     let entropy = SecretBox::new(Box::new(mnemonic.to_entropy()));
     let entropy_bytes = entropy.expose_secret();
     let lo_scalar = entropy_half_to_scalar(&entropy_bytes[..16]);
@@ -361,14 +359,12 @@ pub(crate) fn split_mnemonic<R: rand::RngCore + rand::CryptoRng>(
     Ok(shares)
 }
 
-/// Result of splitting a single scalar via Pedersen VSS.
 struct VssOneScalar {
     share_bytes: Vec<Vec<u8>>,
     blinder_bytes: Vec<Vec<u8>>,
     verification_data: String,
 }
 
-/// Run one independent Pedersen VSS over a single 128-bit scalar.
 fn split_one_scalar<R: rand::RngCore + rand::CryptoRng>(
     scalar: WrappedScalar,
     threshold: u8,
@@ -561,9 +557,6 @@ pub(crate) fn combine_shares_to_mnemonic(
     Ok(mnemonic)
 }
 
-/// Recover the reconstruction threshold from the Pedersen verifier set:
-/// the set is `[g, h, C_0, C_1, ..., C_{t-1}]`, so its length is
-/// `threshold + 2`.
 fn threshold_from_pedersen(pedersen_hex: &str) -> Result<u8> {
     let count = pedersen_hex.split(',').count();
     anyhow::ensure!(
@@ -574,7 +567,6 @@ fn threshold_from_pedersen(pedersen_hex: &str) -> Result<u8> {
     u8::try_from(t).context("Pedersen verifier set encodes a threshold that does not fit in u8")
 }
 
-/// Combine one entropy half, dropping malformed or unverifiable shares.
 fn combine_one_half<T>(
     shares: &[&T],
     extract_secret: impl Fn(&T) -> Option<&str>,
@@ -651,7 +643,6 @@ fn combine_wallet_candidate_to_mnemonic(
     )
 }
 
-/// Split a singlesig wallet into encrypted-wallet-compatible VSS share payloads.
 pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     wallet: &crate::wallet_description::SinglesigJsonWalletDescriptionV0,
     threshold: u8,
@@ -808,12 +799,7 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                         Some(lo) => wallet_verifies_against_candidate(w, lo, hi_set.as_ref()),
                         None => false,
                     })
-                    .map(|w| {
-                        let mut w = w.clone();
-                        w.verification_data = lo_hex.to_string();
-                        w.verification_data_hi = hi_hex_opt.map(str::to_string);
-                        w
-                    })
+                    .map(|w| (*w).clone())
                     .collect();
                 let complete_verified_ids: std::collections::HashSet<VsssScalar> = verified_inputs
                     .iter()
@@ -839,13 +825,10 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
         }
     }
 
-    // Compute public metadata for a normalized, Pedersen-verified group.
     let derive_metadata = |group: &[VssJsonWalletDescriptionV0]| -> SinglesigPublicMetadataV0 {
         if group.is_empty() {
             return SinglesigPublicMetadataV0::default();
         }
-        // Dedupe by cryptographic share id. Duplicate copies only vote when
-        // all metadata copies for that id agree.
         let mut by_id: std::collections::HashMap<VsssScalar, Vec<&VssJsonWalletDescriptionV0>> =
             std::collections::HashMap::new();
         for w in group {
@@ -865,8 +848,6 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                 }
             })
             .collect();
-        // Conflicting duplicate copies abstain, but still count in the
-        // denominator so conflicts cannot shrink their way into a majority.
         if deduped.is_empty() {
             return SinglesigPublicMetadataV0::default();
         }
