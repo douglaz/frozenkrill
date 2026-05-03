@@ -820,7 +820,14 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                     .filter_map(|w| complete_vsss_share_identifier(w, hi_hex_opt.is_some()))
                     .collect();
                 if complete_verified_ids.len() >= candidate_threshold as usize {
-                    successes.push((secret, verified_inputs));
+                    let complete_verified_inputs = verified_inputs
+                        .into_iter()
+                        .filter(|w| {
+                            complete_vsss_share_identifier(w, hi_hex_opt.is_some())
+                                .is_some_and(|id| complete_verified_ids.contains(&id))
+                        })
+                        .collect();
+                    successes.push((secret, complete_verified_inputs));
                 } else {
                     last_err = Some(anyhow!(
                         "Candidate recovered mnemonic but only {} complete verified share identifier(s) were present; threshold is {candidate_threshold}",
@@ -846,6 +853,7 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                 by_id.entry(crypto_id).or_default().push(w);
             }
         }
+        let total_vote_ids = by_id.len();
         let deduped: Vec<&VssJsonWalletDescriptionV0> = by_id
             .into_values()
             .filter_map(|copies| {
@@ -857,8 +865,8 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                 }
             })
             .collect();
-        // If every id conflicted, abstain rather than letting duplicate
-        // metadata copies manufacture a strict majority.
+        // Conflicting duplicate copies abstain, but still count in the
+        // denominator so conflicts cannot shrink their way into a majority.
         if deduped.is_empty() {
             return SinglesigPublicMetadataV0::default();
         }
@@ -879,7 +887,6 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
             }
         }
         // Identity metadata requires a strict majority; ties abstain.
-        let total_votes: usize = counts.iter().map(|(c, _)| *c).sum();
         let top_count = counts.iter().map(|(c, _)| *c).max().unwrap_or(0);
         let top_groups = counts.iter().filter(|(c, _)| *c == top_count).count();
         // `is_duress` also uses strict majority so one tampered share cannot
@@ -888,8 +895,8 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
             .iter()
             .filter(|w| w.original_wallet.is_duress)
             .count();
-        let any_duress = duress_yes * 2 > tally_source.len();
-        let strict_majority = top_groups == 1 && top_count * 2 > total_votes;
+        let any_duress = duress_yes * 2 > total_vote_ids;
+        let strict_majority = top_groups == 1 && top_count * 2 > total_vote_ids;
         let mut metadata = if strict_majority {
             let majority = &counts
                 .iter()
@@ -900,7 +907,7 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
         } else {
             log::warn!(
                 "Pedersen-verified share group has conflicting `original_wallet` metadata \
-                 ({top_groups} variants tied at the top, top_count={top_count} of total_votes={total_votes}); \
+                 ({top_groups} variants tied at the top, top_count={top_count} of total_vote_ids={total_vote_ids}); \
                  no strict majority — returning empty metadata so callers don't trust an \
                  attacker-controlled xpub/network/script_type"
             );
@@ -1041,6 +1048,42 @@ fn describe_share_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split_test_singlesig(
+        phrase: &str,
+        threshold: u8,
+        total_shares: u8,
+        is_duress: bool,
+    ) -> Vec<VssJsonWalletDescriptionV0> {
+        use crate::random_generation_utils::get_secp;
+        use crate::wallet_description::{
+            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
+        };
+        use std::str::FromStr;
+        use std::sync::Arc;
+
+        let mut rng = rand::thread_rng();
+        let secp = get_secp(&mut rng);
+        let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
+        let wallet = SingleSigWalletDescriptionV0::generate(
+            Arc::new(mnemonic),
+            &None,
+            bitcoin::Network::Bitcoin,
+            ScriptType::SegwitNative,
+            &secp,
+        )
+        .unwrap();
+        let json =
+            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
+        split_singlesig_wallet(
+            json.expose_secret(),
+            threshold,
+            total_shares,
+            is_duress,
+            &mut rng,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_split_and_combine_12_words() {
@@ -1515,6 +1558,61 @@ mod tests {
         assert!(
             !recovered.metadata.is_duress,
             "single fabricate attempt against a 3-share normal split must lose to majority"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_metadata_conflicts_count_against_duress_majority() {
+        let vss = split_test_singlesig(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            2,
+            3,
+            false,
+        );
+        let mut fabricated_duress = vss[0].clone();
+        fabricated_duress.original_wallet.is_duress = true;
+        let mut conflicting_duplicate = vss[1].clone();
+        conflicting_duplicate.original_wallet.sigtype = "tampered".to_string();
+        let mixed = vec![fabricated_duress, vss[1].clone(), conflicting_duplicate];
+
+        let err = match combine_vss_wallets(&mixed) {
+            Ok(_) => panic!(
+                "conflicting duplicate metadata must not shrink the denominator enough to fabricate duress"
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not be authenticated"),
+            "expected fail-closed authentication error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_spliced_lo_hi_share_does_not_vote_on_metadata() {
+        let mut vss = split_test_singlesig(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+            2,
+            3,
+            false,
+        );
+        let mut splice = vss[0].clone();
+        splice.share_data_hi = vss[1].share_data_hi.clone();
+        splice.blinder_share_data_hi = vss[1].blinder_share_data_hi.clone();
+        let mut conflicting_duplicate = vss[2].clone();
+        conflicting_duplicate.original_wallet.sigtype = "tampered".to_string();
+        let mixed = vec![vss.remove(1), vss.remove(1), conflicting_duplicate, splice];
+
+        let err = match combine_vss_wallets(&mixed) {
+            Ok(_) => panic!(
+                "lo/hi-spliced shares must not contribute metadata votes for incomplete share ids"
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not be authenticated"),
+            "expected fail-closed authentication error, got: {msg}"
         );
     }
 
