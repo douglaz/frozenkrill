@@ -143,25 +143,8 @@ pub(crate) fn combine_shares(
     let reconstructed = combine_vss_wallets(&decrypted_shares)
         .context("Failed to combine shares. Shares may be from different wallets or corrupted.")?;
 
-    // Cross-check the recovered mnemonic against the (group-aggregated)
-    // public metadata when we HAVE meaningful metadata. The lib-side
-    // recovery path returns *empty* metadata when the per-group
-    // metadata vote tied (e.g. exact-threshold + one tampered share),
-    // and in that case the seed itself is still recoverable — we just
-    // can't authenticate it against an xpub we don't have. Detect
-    // that case (network/xpub blank), surface a "metadata
-    // unauthenticated" warning, and still print the seed. Otherwise
-    // run `rebuild_singlesig`, which re-derives the no-passphrase
-    // wallet from the recovered seed and asserts its xpub matches
-    // the share metadata's `singlesig_xpub`. This catches tamper
-    // cases that raw mnemonic recovery doesn't (e.g. a 24-word share
-    // set whose `*_hi` fields were stripped — combine produces a
-    // 12-word mnemonic but the rebuilt xpub wouldn't match the
-    // original 24-word wallet's stored xpub).
-    // Authentication is now enforced inside `combine_vss_wallets`
-    // itself — it returns Err on empty metadata or xpub mismatch — so
-    // by the time we get here the recovery is already authenticated
-    // against the wallet's xpub.
+    // `combine_vss_wallets` authenticates the recovered seed against
+    // the group's wallet metadata before returning.
 
     spinner.finish_with_message("✓ Shares verified and combined successfully");
 

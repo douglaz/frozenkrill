@@ -37,9 +37,8 @@ impl VssRecovery {
     /// This is the **safe** entry point for reconstructing a wallet
     /// from a successful `combine_vss_wallets`: the duress decision
     /// uses `self.metadata.is_duress`, which is a strict-majority
-    /// decision over the verified group — a single tampered share's `is_duress` byte
-    /// cannot redirect a passphrase restore the way it could in the
-    /// per-share `to_singlesig` path.
+    /// decision over the verified group — a single tampered share's
+    /// `is_duress` byte cannot redirect a passphrase restore.
     ///
     /// Rules:
     ///   * normal recovery + caller passes `Some(non-empty)` ⇒ refuse.
@@ -1196,8 +1195,9 @@ mod tests {
     }
 
     /// End-to-end test of `split_singlesig_wallet` → `combine_vss_wallets` →
-    /// `to_singlesig`, including the xpub re-validation. Also confirms that
-    /// each VSS share file no longer carries the seed phrase or any xpriv.
+    /// `VssRecovery::rebuild_singlesig`, including the xpub re-validation.
+    /// Also confirms that each VSS share file no longer carries the seed
+    /// phrase or any xpriv.
     #[test]
     fn test_vss_singlesig_round_trip_no_secret_leak() {
         use crate::random_generation_utils::get_secp;
@@ -1244,11 +1244,9 @@ mod tests {
         let recovered_phrase = recovered.mnemonic.expose_secret().to_string();
         assert_eq!(recovered_phrase, seed_phrase);
 
-        // to_singlesig should rebuild the wallet from the recovered mnemonic
-        // + the share metadata, and pass the xpub re-validation.
-        let rebuilt = vss_wallets[0]
-            .to_singlesig(&recovered_phrase, &None, &secp)
-            .unwrap();
+        // rebuild_singlesig should rebuild the wallet from the recovered
+        // mnemonic + group metadata, and pass the xpub re-validation.
+        let rebuilt = recovered.rebuild_singlesig(&None, &secp).unwrap();
         assert_eq!(
             rebuilt.encoded_singlesig_xpub(),
             wallet.encoded_singlesig_xpub()
@@ -1660,12 +1658,12 @@ mod tests {
         );
     }
 
-    /// `to_singlesig` must refuse a passphrase on a NORMAL share —
+    /// `VssRecovery::rebuild_singlesig` must refuse a passphrase on a NORMAL share set —
     /// otherwise a typo'd or accidentally-supplied passphrase would
     /// silently reconstruct an unrelated wallet (there is no on-disk
     /// witness for a passphrase-derived wallet on a normal share).
     #[test]
-    fn test_to_singlesig_refuses_passphrase_on_normal_share() {
+    fn test_rebuild_singlesig_refuses_passphrase_on_normal_share() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
             ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
@@ -1690,17 +1688,14 @@ mod tests {
         // is_duress=false: this is a normal share.
         let vss = split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
         let recovered = combine_vss_wallets(&vss[0..2]).unwrap();
-        let recovered_phrase = recovered.mnemonic.expose_secret().to_string();
 
         // Without a passphrase: succeeds.
-        vss[0]
-            .to_singlesig(&recovered_phrase, &None, &secp)
-            .unwrap();
+        recovered.rebuild_singlesig(&None, &secp).unwrap();
 
         // With a passphrase: must be refused.
         let typo = Arc::new(secrecy::SecretString::from("oops typo".to_string()));
-        let err = match vss[0].to_singlesig(&recovered_phrase, &Some(typo), &secp) {
-            Ok(_) => panic!("expected to_singlesig to refuse a passphrase on a normal share"),
+        let err = match recovered.rebuild_singlesig(&Some(typo), &secp) {
+            Ok(_) => panic!("expected rebuild_singlesig to refuse a passphrase on a normal share"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
@@ -1716,9 +1711,7 @@ mod tests {
     /// covers that path: the share files were created in duress mode,
     /// recovery yields the seed, and rebuild_singlesig with the
     /// non-duress passphrase returns the real wallet (different from
-    /// the decoy). It also verifies that the per-share `to_singlesig`
-    /// REFUSES the same passphrase, so a tampered single share's
-    /// is_duress flag can never sneak a passphrase restore through.
+    /// the decoy).
     #[test]
     fn test_vss_recovery_supports_duress_restore_with_passphrase() {
         use crate::random_generation_utils::get_secp;
@@ -1757,28 +1750,13 @@ mod tests {
             real.encoded_singlesig_xpub(),
             decoy.encoded_singlesig_xpub()
         );
-
-        // Per-share path refuses passphrases (defense in depth).
-        let err = match vss[0].to_singlesig(
-            &recovered.mnemonic.expose_secret().to_string(),
-            &Some(passphrase),
-            &secp,
-        ) {
-            Ok(_) => panic!("per-share to_singlesig must refuse passphrases"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("VssRecovery::rebuild_singlesig"),
-            "expected per-share refusal pointing at the safe API, got: {msg}"
-        );
     }
 
     /// A share whose embedded singlesig_xpub has been swapped for a different
-    /// wallet's xpub must be rejected by `to_singlesig`, even when the
+    /// wallet's xpub must be rejected by `combine_vss_wallets`, even when the
     /// combined mnemonic is valid. This is the metadata-tamper guard.
     #[test]
-    fn test_vss_to_singlesig_rejects_tampered_xpub() {
+    fn test_combine_vss_wallets_rejects_tampered_xpub() {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
             ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
@@ -1822,17 +1800,12 @@ mod tests {
 
         // Sanity: the legitimate xpub differs from the impostor.
         assert_ne!(vss_wallets[0].original_wallet.singlesig_xpub, bad_xpub);
-        vss_wallets[0].original_wallet.singlesig_xpub = bad_xpub.clone();
+        for share in &mut vss_wallets[0..2] {
+            share.original_wallet.singlesig_xpub = bad_xpub.clone();
+        }
 
-        // Drive `to_singlesig` directly with the known-good seed phrase.
-        // We deliberately do NOT go through `combine_vss_wallets` here:
-        // that path now internally authenticates the recovered seed
-        // against the share metadata's xpub and would reject this
-        // tampered set before we got a chance to exercise the
-        // per-share `to_singlesig` xpub guard. This test isolates the
-        // `to_singlesig` xpub validation path.
-        let err = match vss_wallets[0].to_singlesig(seed_phrase, &None, &secp) {
-            Ok(_) => panic!("expected to_singlesig to reject the tampered xpub"),
+        let err = match combine_vss_wallets(&vss_wallets[0..2]) {
+            Ok(_) => panic!("expected combine_vss_wallets to reject the tampered xpub"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");

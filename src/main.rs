@@ -1169,9 +1169,8 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             // shares as duress (otherwise recovery would later refuse
             // to open them as a normal share, and the duress warning
             // would mislead the user). The flag gets baked into each
-            // share's metadata so that `combine-secret` / `to_singlesig`
-            // can later require/refuse a passphrase appropriately at
-            // restore time.
+            // share's metadata so recovery can later require/refuse a
+            // passphrase appropriately at restore time.
             let is_duress_split = non_duress_password
                 .as_ref()
                 .is_some_and(|p| !p.expose_secret().is_empty());
