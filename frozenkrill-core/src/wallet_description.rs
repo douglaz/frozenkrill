@@ -647,7 +647,7 @@ impl PsbtWallet for SingleSigWalletDescriptionV0 {
     }
 }
 
-#[derive(Clone, Default, Zeroize, ZeroizeOnDrop, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default, Zeroize, ZeroizeOnDrop, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SinglesigJsonWalletDescriptionV0 {
     pub version: WalletVersionType,
     pub sigtype: String,
@@ -1146,7 +1146,7 @@ impl MultiSigCompactWalletDescriptionV0 {
     }
 }
 
-#[derive(Clone, Default, Zeroize, ZeroizeOnDrop, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default, Zeroize, ZeroizeOnDrop, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MultisigJsonWalletDescriptionV0 {
     pub version: WalletVersionType,
     pub sigtype: String,
