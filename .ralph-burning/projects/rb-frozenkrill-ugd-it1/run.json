@@ -2,34 +2,71 @@
   "active_run": {
     "run_id": "run-20260502233654",
     "stage_cursor": {
-      "stage": "final_review",
+      "stage": "plan_and_implement",
       "cycle": 1,
       "attempt": 1,
-      "completion_round": 2
+      "completion_round": 3
     },
     "started_at": "2026-05-02T23:36:54.906199582Z",
     "prompt_hash_at_cycle_start": "07c37684b8917b56f93e15400de45e3546949f6e0f79dc19db285c862c107b62",
     "prompt_hash_at_stage_start": "07c37684b8917b56f93e15400de45e3546949f6e0f79dc19db285c862c107b62",
     "qa_iterations_current_cycle": 0,
     "review_iterations_current_cycle": 0,
-    "final_review_restart_count": 1
+    "final_review_restart_count": 2
   },
   "status": "running",
   "cycle_history": [],
-  "completion_rounds": 2,
+  "completion_rounds": 3,
   "max_completion_rounds": 25,
   "rollback_point_meta": {
     "last_rollback_id": null,
     "rollback_count": 0
   },
   "amendment_queue": {
-    "pending": [],
+    "pending": [
+      {
+        "amendment_id": "fr-2-c6573dbe",
+        "source_stage": "final_review",
+        "source_cycle": 1,
+        "source_completion_round": 2,
+        "body": "Whole-file acceptance metric at frozenkrill-core/src/secret_sharing.rs:1: the bead's required net reduction is not met. `git diff --numstat feature/pedersen-secret-sharing..HEAD -- frozenkrill-core/src/secret_sharing.rs` reports 210 insertions and 378 deletions, a net reduction of 168 lines, but the prompt requires at least 180. Trim at least 12 more lines from this file without deleting test coverage before closing the bead.",
+        "created_at": "2026-05-03T00:27:22.420563200Z",
+        "batch_sequence": 1,
+        "source": "workflow_stage",
+        "dedup_key": "6f979c914cbc9f1cfe7c05adfeab1808d4d174a72f0b5caeaaeba822fd24e579",
+        "classification": "fix_current_bead"
+      },
+      {
+        "amendment_id": "fr-2-cf111a85",
+        "source_stage": "final_review",
+        "source_cycle": 1,
+        "source_completion_round": 2,
+        "body": "Drop the dead `verification_data` / `verification_data_hi` rewrite when constructing `SuccessEntry::verified_inputs` in `combine_vss_wallets` (`frozenkrill-core/src/secret_sharing.rs:811-816`).\n\nThe current code is:\n\n```rust\nlet verified_inputs: Vec<VssJsonWalletDescriptionV0> = vss_wallets\n.iter()\n.copied()\n.filter(|w| match &lo_set {\nSome(lo) => wallet_verifies_against_candidate(w, lo, hi_set.as_ref()),\nNone => false,\n})\n.map(|w| {\nlet mut w = w.clone();\nw.verification_data = lo_hex.to_string();\nw.verification_data_hi = hi_hex_opt.map(str::to_string);\nw\n})\n.collect();\n```\n\nThe `.clone()` is necessary (we need owned `VssJsonWalletDescriptionV0` values for `Vec`), but the field rewrite is unused. Every downstream consumer of these entries reads only `share_data`, `share_data_hi`, `original_wallet`, `share_index`, `created_at`, `threshold`, and `total_shares`:\n- `derive_metadata` (`secret_sharing.rs:843-918`) reads `share_data` and `original_wallet`.\n- `describe_share_group` (`secret_sharing.rs:1022-1046`) reads `share_index`, `created_at`, `threshold`, `total_shares`.\n- `complete_vsss_share_identifier` (`secret_sharing.rs:203-215`) reads `share_data` and `share_data_hi`.\n\nNothing reads `verification_data` or `verification_data_hi` after the verifier filter ran. Replacing the closure with `.map(|w| w.clone())` is functionally equivalent, drops a few lines, and avoids the slightly confusing artifact where `SuccessEntry`'s wallets carry verifier strings that are *neither* the share's own copy *nor* read anywhere — making it harder for future readers to reason about what state these clones represent.",
+        "created_at": "2026-05-03T00:27:22.420585341Z",
+        "batch_sequence": 2,
+        "source": "workflow_stage",
+        "dedup_key": "739e8bfd443169be985e450389249d01b1dad0b2f0dcadb406217cb60682a648",
+        "classification": "fix_current_bead"
+      },
+      {
+        "amendment_id": "fr-2-aa4d3f78",
+        "source_stage": "final_review",
+        "source_cycle": 1,
+        "source_completion_round": 2,
+        "body": "Net line reduction in `frozenkrill-core/src/secret_sharing.rs` is 168 lines (210 insertions, 378 deletions) versus the bead's stated acceptance criterion of \"at least 180 lines\".\n\nMeasured via `git diff --stat feature/pedersen-secret-sharing..HEAD -- frozenkrill-core/src/secret_sharing.rs`. Branch tip is `253da64` (bead's plan_and_implement c1 r2 checkpoint); base tip is `36cc219`.\n\nThe two structural goals (drop the internal `Share` struct, drop the trailing verifier hex fields from `SuccessEntry`) are met. The shortfall is partly attributable to the ~80 lines of new test scaffolding added (`split_test_singlesig` helper + two new defense-in-depth tests for the conflict-denominator and lo/hi-splice cases). Those additions are valuable — the splice test in particular catches an attack class that would otherwise rely on `complete_vsss_share_identifier`'s implementation surviving future refactors — so I would not propose removing them to hit the line target.\n\nA combined fix would be: drop the dead-code verifier rewrite in the previous amendment (~3-4 lines), and tighten the surviving doc comments on `split_mnemonic`, `combine_one_half`, and `combine_wallet_candidate_to_mnemonic` (the docstrings are now somewhat stale post-collapse). Together that should close the gap.\n\nIf the bead reviewer judges the 12-line shortfall as acceptable given the new tests, classifying this as informational rather than a blocker is reasonable.",
+        "created_at": "2026-05-03T00:27:22.420605108Z",
+        "batch_sequence": 3,
+        "source": "workflow_stage",
+        "dedup_key": "190badc1d91d61342d33053a9300219b3e57e14e9f5424e2945dc0f1495130ab",
+        "classification": "fix_current_bead"
+      }
+    ],
     "processed_count": 1
   },
-  "status_summary": "running: completed Plan and Implement, next Final Review",
+  "status_summary": "running: final review restart round 3 -> Plan and Implement",
   "last_stage_resolution_snapshot": {
     "stage_id": "final_review",
-    "resolved_at": "2026-05-02T23:52:03.616242852Z",
+    "resolved_at": "2026-05-03T00:15:20.199200768Z",
     "final_review_reviewers": [
       {
         "backend_family": "codex",
