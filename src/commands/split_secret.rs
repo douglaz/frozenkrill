@@ -24,11 +24,8 @@ use crate::progress_bar::get_spinner;
 /// Split a wallet's seed phrase into shares using Pedersen secret sharing.
 ///
 /// `is_duress` records, in the share metadata, whether the user supplied a
-/// non-duress BIP-39 passphrase at split time. The flag is later
-/// authenticated by `to_singlesig` to decide whether a passphrase is
-/// required (duress) or refused (normal) at restore time — this prevents a
-/// mistyped passphrase from silently producing an unrelated wallet during
-/// recovery of a normal share.
+/// non-duress BIP-39 passphrase at split time. Recovery later uses the
+/// group-authenticated flag to decide whether a passphrase is accepted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn split_singlesig_wallet(
     secp: &Secp256k1<All>,
@@ -49,31 +46,6 @@ pub(crate) fn split_singlesig_wallet(
     anyhow::ensure!(
         matches!(encrypted_version, EncryptedWalletVersion::V0Standard),
         "VSS shares require V0Standard encrypted wallet version (got {encrypted_version:?}); the compact format cannot be decrypted"
-    );
-
-    // Validate output directory exists
-    anyhow::ensure!(
-        output_dir.exists(),
-        "Output directory does not exist: {}",
-        output_dir.display()
-    );
-
-    anyhow::ensure!(
-        output_dir.is_dir(),
-        "Output path is not a directory: {}",
-        output_dir.display()
-    );
-
-    // Validate threshold/total_shares before formatting any human-readable
-    // strings so an invalid M-of-N pair (threshold > total_shares) cannot
-    // underflow `total_shares - threshold + 1` in the warning below.
-    anyhow::ensure!(
-        threshold >= 2 && total_shares >= 2,
-        "Threshold and total shares must each be at least 2 (got threshold={threshold}, total_shares={total_shares})"
-    );
-    anyhow::ensure!(
-        threshold <= total_shares,
-        "Threshold ({threshold}) cannot exceed total shares ({total_shares})"
     );
 
     // The "do you understand the risks?" confirmation prompt now runs
