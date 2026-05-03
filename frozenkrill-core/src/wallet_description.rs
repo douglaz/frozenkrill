@@ -1348,42 +1348,6 @@ pub struct VssJsonWalletDescriptionV0 {
 }
 
 impl VssJsonWalletDescriptionV0 {
-    /// Create a new VSS wallet description from a singlesig wallet.
-    ///
-    /// Only public metadata is embedded; the seed phrase and xprivs are NOT
-    /// copied into the share.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_singlesig(
-        wallet_json: &SinglesigJsonWalletDescriptionV0,
-        share_index: u8,
-        threshold: u8,
-        total_shares: u8,
-        mnemonic_length: u8,
-        share_data: String,
-        blinder_share_data: String,
-        verification_data: String,
-        share_data_hi: Option<String>,
-        blinder_share_data_hi: Option<String>,
-        verification_data_hi: Option<String>,
-        is_duress: bool,
-    ) -> Self {
-        Self {
-            version: ZERO_VSS_WALLET_VERSION,
-            share_index,
-            threshold,
-            total_shares,
-            mnemonic_length,
-            share_data,
-            blinder_share_data,
-            verification_data,
-            share_data_hi,
-            blinder_share_data_hi,
-            verification_data_hi,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            original_wallet: SinglesigPublicMetadataV0::from_singlesig_json(wallet_json, is_duress),
-        }
-    }
-
     /// Deserialize from JSON
     pub fn deserialize(data: BufReader<impl Read>) -> anyhow::Result<Secret<Self>> {
         let w =

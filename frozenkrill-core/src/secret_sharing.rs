@@ -124,9 +124,6 @@ use zeroize::Zeroize;
 /// Error types for secret sharing operations
 #[derive(Debug, thiserror::Error)]
 pub enum SecretSharingError {
-    #[error("Threshold must be between 2 and total shares")]
-    InvalidThreshold,
-
     #[error("Total shares must be between 2 and 255")]
     InvalidShareCount,
 
@@ -139,17 +136,11 @@ pub enum SecretSharingError {
     #[error("Share verification failed - share may be corrupted or invalid")]
     VerificationFailed,
 
-    #[error("Incompatible shares: {0}")]
-    IncompatibleShares(String),
-
     #[error("Insufficient shares: need {threshold}, got {provided}")]
     InsufficientShares { threshold: u8, provided: usize },
 
     #[error("Invalid mnemonic checksum after reconstruction")]
     InvalidReconstructedChecksum,
-
-    #[error("Share file format error: {0}")]
-    FileFormatError(String),
 }
 
 /// Pack a 16-byte entropy half into a Curve25519 scalar.
