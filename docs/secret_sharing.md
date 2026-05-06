@@ -70,6 +70,19 @@ Pedersen VSS solves this by allowing share holders to verify their shares are ge
 
 ## Usage
 
+### Migration note
+
+`split-secret` does not support its own `--enable-duress-wallet` flag. That
+flag is still available on the existing wallet-level commands that document
+duress wallets, but it is separate from VSS secret sharing.
+
+If you created VSS shares with an unreleased build that accepted
+`split-secret --enable-duress-wallet`, create a new share set without that
+flag. To recover an old experimental set, `combine-secret` prints the
+reconstructed mnemonic; use that mnemonic together with the BIP-39 passphrase
+from the old split-secret flow when importing or rebuilding the passphrase
+protected wallet.
+
 ### Splitting a Seed
 
 To split an existing wallet's seed phrase:

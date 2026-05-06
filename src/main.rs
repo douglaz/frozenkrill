@@ -1337,9 +1337,7 @@ fn ask_password(theme: &dyn Theme, term: &Term) -> anyhow::Result<SecretString> 
 fn ask_non_duress_password(theme: &dyn Theme, term: &Term) -> anyhow::Result<Arc<SecretString>> {
     // The global non-duress prompt requires a non-empty passphrase:
     // the existing duress-wallet flows (generate, open) need it to
-    // genuinely differ from the decoy. `split-secret` has its own
-    // local prompt (`ask_optional_non_duress_password`) that accepts
-    // empty input and translates that into "no duress mode".
+    // genuinely differ from the decoy.
     Ok(Arc::new(SecretString::new(
         dialoguer::Password::with_theme(theme)
             .with_prompt("Enter a non duress seed password")
