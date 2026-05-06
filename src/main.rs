@@ -511,12 +511,6 @@ struct SplitSecretArgs {
     common: CommonOpenArgs,
     #[clap(
         long,
-        action,
-        help = ENABLE_DURESS_WALLET
-    )]
-    enable_duress_wallet: bool,
-    #[clap(
-        long,
         help = "Minimum number of shares needed to reconstruct the secret (M in M-of-N)",
         default_value = "3"
     )]
@@ -951,9 +945,8 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             // there is no `--wallet-file-type` flag here.
 
             // Run the offline-only safety gate BEFORE we ask the user
-            // for any credentials. The wallet password and (in duress
-            // mode) the BIP-39 passphrase are sensitive secrets; the
-            // user shouldn't be prompted to type them on a connected
+            // for any credentials. The wallet password is sensitive;
+            // the user shouldn't be prompted to type it on a connected
             // host that we'd then refuse anyway. This mirrors the
             // open/show-secrets flows.
             let mut ic = ic;
@@ -962,8 +955,7 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             // Validate cheap CLI inputs (M-of-N pair, output dir,
             // padding range) BEFORE asking for any secret. Otherwise
             // a command that's guaranteed to fail downstream would
-            // still collect the wallet password and (in duress mode)
-            // the BIP-39 passphrase from the user.
+            // still collect the wallet password from the user.
             anyhow::ensure!(
                 args.threshold >= 2 && args.total_shares >= 2,
                 "Threshold and total shares must each be at least 2 (got threshold={}, total_shares={})",
@@ -996,8 +988,7 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             // Preflight the source wallet path too, so a missing /
             // unreadable input file is rejected before we collect any
             // secrets. The downstream open path would error eventually
-            // either way, but only after `ask_password` (and, in
-            // duress mode, the BIP-39 passphrase prompt) had run.
+            // either way, but only after `ask_password` had run.
             let preflight_wallet_input = std::path::Path::new(&args.common.wallet_input_file);
             anyhow::ensure!(
                 preflight_wallet_input.exists(),
@@ -1025,9 +1016,9 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
             // Show the M-of-N risk warning and require confirmation
             // BEFORE we ask the user for any secret. If they cancel at
             // the warning, we don't want to have already prompted for
-            // (and held in memory) the wallet password and — in duress
-            // mode — the BIP-39 passphrase. Putting the prompt here
-            // also means a typo / cancel costs zero credential entry.
+            // (and held in memory) the wallet password. Putting the
+            // prompt here also means a typo / cancel costs zero
+            // credential entry.
             println!("\n⚠️  WARNING: Secret Sharing Operation");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!(
@@ -1100,16 +1091,6 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
 
             // Build the open args without the password field; we pass the
             // already-wrapped SecretString in directly.
-            //
-            // We deliberately set `enable_duress_wallet: false` on the
-            // open args even when the user passed `--enable-duress-wallet`.
-            // The shared `singlesig_core_open` path forwards duress mode
-            // into `ask_non_duress_password`, which requires a non-empty
-            // passphrase — and split-secret needs to allow Enter-to-skip
-            // (an empty passphrase = no duress mode). We instead ask
-            // separately here with `ask_optional_non_duress_password`,
-            // which accepts empty input cleanly and returns `None` in
-            // that case.
             let open_args = SinglesigOpenArgs {
                 common: CommonOpenArgs {
                     keyfile: args.common.keyfile.clone(),
@@ -1132,112 +1113,6 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                     &open_args,
                     Some(Arc::clone(&password)),
                 )?;
-            let non_duress_password = if args.enable_duress_wallet {
-                ask_optional_non_duress_password(theme.as_ref(), term)?
-            } else {
-                None
-            };
-
-            // Duress-mode handling. The decoy wallet and the real wallet
-            // share the *same* BIP-39 mnemonic — the only difference is the
-            // BIP-39 passphrase, which is mixed in at seed-derivation time
-            // and is *not* part of the mnemonic itself. So splitting the
-            // decoy wallet's mnemonic produces shares that, when combined,
-            // reconstruct that same mnemonic — which is also the real
-            // wallet's mnemonic. The user only needs the BIP-39 passphrase
-            // (from memory) to switch from the decoy view to the real view.
-            //
-            // Critically, we keep the share-file `original_wallet` metadata
-            // pinned to the *decoy* wallet here. The shares are encrypted
-            // with the same wallet password the user typed at the prompt,
-            // and in a coercion scenario that password is precisely what
-            // the attacker is most likely to obtain. If the embedded
-            // metadata described the real wallet (xpub, addresses, …), a
-            // single decrypted share would let a coerced attacker prove the
-            // hidden wallet exists — defeating plausible deniability. With
-            // decoy metadata, an attacker who decrypts a share sees only
-            // the decoy.
-            //
-            // We still ask for, and double-check, the non-duress passphrase
-            // to make sure the user actually knows it (otherwise they would
-            // be locked out of the real wallet without realizing it),
-            // because once the shares are written they cannot be amended.
-            // Whether THIS split is in duress mode: yes iff the user
-            // supplied a *non-empty* non-duress passphrase. BIP-39
-            // treats an empty passphrase as the normal wallet, so just
-            // pressing Enter at the duress prompt should NOT mark the
-            // shares as duress (otherwise recovery would later refuse
-            // to open them as a normal share, and the duress warning
-            // would mislead the user). The flag gets baked into each
-            // share's metadata so recovery can later require/refuse a
-            // passphrase appropriately at restore time.
-            let is_duress_split = non_duress_password
-                .as_ref()
-                .is_some_and(|p| !p.expose_secret().is_empty());
-            if is_duress_split && let Some(non_duress_password) = non_duress_password.as_ref() {
-                commands::common::double_check_non_duress_password(
-                    theme.as_ref(),
-                    term,
-                    non_duress_password,
-                )?;
-
-                // Derive the wallet that the user's typed passphrase
-                // would actually open and show its first address. Then
-                // require the user to confirm it's the wallet they
-                // think they're backing up. Without this check, a
-                // *consistent typo* on the duress passphrase passes the
-                // double-check above but produces shares for the wrong
-                // hidden wallet — funds behind the real passphrase
-                // would never be backed up. There's no on-disk witness
-                // for the hidden wallet (by design, for plausible
-                // deniability), so visual confirmation against the
-                // user's own knowledge of their funded address is the
-                // only check available.
-                let candidate_real =
-                    wallet.change_seed_password(&Some(Arc::clone(non_duress_password)), &secp)?;
-                let candidate_first_address =
-                    candidate_real.first_receiving_address(&secp)?.to_string();
-                println!("\n⚠️  CONFIRM HIDDEN-WALLET ADDRESS");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("Using the non-duress passphrase you just typed, the hidden");
-                println!("wallet's first receiving address is:");
-                println!();
-                println!("    {candidate_first_address}");
-                println!();
-                println!("If this is NOT the wallet you intend to back up (e.g. the");
-                println!("address does not match the funded wallet you think you have");
-                println!("behind your duress passphrase), the passphrase you typed is");
-                println!("wrong and these shares would silently strand those funds.");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-                let confirmed = Confirm::with_theme(theme.as_ref())
-                    .with_prompt("Is this the hidden wallet you want to back up with these shares?")
-                    .default(false)
-                    .interact_on(term)?;
-                if !confirmed {
-                    anyhow::bail!(
-                        "User did not confirm the hidden-wallet address — refusing to write \
-                         duress-mode shares that may not back up the intended wallet"
-                    );
-                }
-                drop(candidate_real);
-
-                println!("\n⚠️  DURESS-MODE BACKUP NOTE");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("Each share file embeds DECOY-wallet metadata only — that is");
-                println!("intentional. If a coerced attacker learns the wallet password");
-                println!("they can decrypt one share and see only the decoy's xpub and");
-                println!("first address, never the real wallet's identity.");
-                println!();
-                println!("The split shares back up the SEED, which is the SAME for the");
-                println!("decoy and the real wallet. To restore the real wallet you must");
-                println!("(a) reconstruct the seed via `combine-secret`, AND");
-                println!("(b) supply the non-duress BIP-39 passphrase from memory.");
-                println!("`combine-secret` plus the shares alone yield the decoy view.");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-            }
-            // Use the decoy wallet (`wallet` as returned above) for both
-            // splitting and metadata embedding. We deliberately do NOT call
-            // `change_seed_password` here.
 
             // Create padding params
             let padding_params = PaddingParams::new(
@@ -1283,7 +1158,6 @@ fn process(cli: Cli, theme: Box<dyn Theme>, term: &Term) -> Result<(), anyhow::E
                 share_difficulty,
                 &padding_params,
                 encrypted_version,
-                is_duress_split,
                 &mut rng,
             )?;
         }
@@ -1474,27 +1348,6 @@ fn ask_non_duress_password(theme: &dyn Theme, term: &Term) -> anyhow::Result<Arc
             .context("failure reading password")?
             .into(),
     )))
-}
-
-/// Variant of `ask_non_duress_password` used by `split-secret` only.
-/// Accepts empty input and returns `None` in that case. The caller
-/// then treats `None` as "the user does not want duress mode for this
-/// split", and writes normal (non-duress) shares.
-fn ask_optional_non_duress_password(
-    theme: &dyn Theme,
-    term: &Term,
-) -> anyhow::Result<Option<Arc<SecretString>>> {
-    let typed = dialoguer::Password::with_theme(theme)
-        .with_prompt("Enter the non-duress BIP-39 passphrase (leave blank if the wallet has none)")
-        .allow_empty_password(true)
-        .with_confirmation("Confirm passphrase", "Passphrases don't match, try again")
-        .interact_on(term)
-        .context("failure reading passphrase")?;
-    if typed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Arc::new(SecretString::new(typed.into()))))
-    }
 }
 
 pub(crate) fn get_derivation_key_spinner() -> ProgressBar {

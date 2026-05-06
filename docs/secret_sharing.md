@@ -93,7 +93,6 @@ frozenkrill split-secret \
 - `--password`: Password used to open the source wallet (will prompt if not provided)
 - `--keyfile`: Optional keyfile(s) used to open the source wallet
 - `--difficulty`: Key derivation difficulty used to open the source wallet (easy/normal/hard/veryhard)
-- `--enable-duress-wallet`: Use duress wallet instead of main wallet
 - `--disable-all-padding`: Disable padding (not recommended)
 - `--share-password`: Optional password used to encrypt the share files; defaults to the source wallet password
 - `--share-keyfile`: Optional keyfile(s) used to encrypt the share files; defaults to the source wallet keyfiles
@@ -151,8 +150,7 @@ Shares are stored as encrypted .frozenkrill wallet files with the following stru
     "singlesig_receiving_output_descriptor": "wpkh(...)",
     "singlesig_change_output_descriptor": "wpkh(...)",
     "network": "bitcoin",
-    "script_type": "segwit-native",
-    "is_duress": false
+    "script_type": "segwit-native"
   }
 }
 ```

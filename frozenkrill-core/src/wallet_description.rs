@@ -1290,16 +1290,12 @@ pub struct SinglesigPublicMetadataV0 {
     pub singlesig_change_output_descriptor: String,
     pub network: String,
     pub script_type: String,
-    /// `true` for duress-mode shares, whose embedded xpub/addresses describe
-    /// the decoy wallet. Defaults to normal/non-duress for older shares.
-    #[serde(default)]
-    pub is_duress: bool,
 }
 
 impl SinglesigPublicMetadataV0 {
     /// Project a full singlesig wallet json into the public-only metadata that
     /// gets embedded in each share.
-    pub fn from_singlesig_json(w: &SinglesigJsonWalletDescriptionV0, is_duress: bool) -> Self {
+    pub fn from_singlesig_json(w: &SinglesigJsonWalletDescriptionV0) -> Self {
         Self {
             version: w.version,
             sigtype: w.sigtype.clone(),
@@ -1313,7 +1309,6 @@ impl SinglesigPublicMetadataV0 {
             singlesig_change_output_descriptor: w.singlesig_change_output_descriptor.clone(),
             network: w.network.to_string(),
             script_type: w.script_type.to_string(),
-            is_duress,
         }
     }
 }

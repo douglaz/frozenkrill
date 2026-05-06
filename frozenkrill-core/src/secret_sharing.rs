@@ -24,8 +24,7 @@ type VsssVerifier = ValueGroup<WrappedRistretto>;
 
 /// Result of a successful `combine_vss_wallets`. Bundles the recovered
 /// mnemonic with the chosen share group's public metadata so callers can
-/// surface user-facing context (e.g. "this share set was created in duress
-/// mode — you also need the BIP-39 passphrase to recover the real wallet").
+/// authenticate and rebuild the wallet described by the shares.
 pub struct VssRecovery {
     pub mnemonic: SecretBox<Mnemonic>,
     pub metadata: SinglesigPublicMetadataV0,
@@ -35,18 +34,10 @@ impl VssRecovery {
     /// Rebuild a `SingleSigWalletDescriptionV0` from this recovery.
     ///
     /// This is the **safe** entry point for reconstructing a wallet
-    /// from a successful `combine_vss_wallets`: the duress decision
-    /// uses `self.metadata.is_duress`, which is a strict-majority
-    /// decision over the verified group — a single tampered share's
-    /// `is_duress` byte cannot redirect a passphrase restore.
-    ///
-    /// Rules:
-    ///   * normal recovery + caller passes `Some(non-empty)` ⇒ refuse.
-    ///   * duress recovery + caller passes `Some(non-empty)` ⇒ build
-    ///     the passphrase-derived (real) wallet and return it.
-    ///   * either + caller passes `None` (or `Some("")`) ⇒ return the
-    ///     no-passphrase wallet (the decoy in duress mode, the wallet
-    ///     itself in normal mode).
+    /// from a successful `combine_vss_wallets`. Empty passphrases are
+    /// normalized to no passphrase; non-empty passphrases are passed
+    /// through to BIP-39 derivation after the recovered mnemonic is
+    /// authenticated against the share metadata.
     pub fn rebuild_singlesig(
         &self,
         seed_password: &Option<std::sync::Arc<secrecy::SecretString>>,
@@ -58,15 +49,6 @@ impl VssRecovery {
             Some(pw) if !pw.expose_secret().is_empty() => Some(Arc::clone(pw)),
             _ => None,
         };
-
-        if !self.metadata.is_duress && effective_pw.is_some() {
-            bail!(
-                "This share set was not created in duress mode, but a BIP-39 passphrase \
-                 was supplied. Restoring with a passphrase here would silently produce \
-                 an unrelated wallet derived from the supplied (possibly mistyped) \
-                 passphrase. Re-run without a passphrase, or use a duress-mode share set."
-            );
-        }
 
         // Clone the inner `Mnemonic` directly into a fresh
         // `SecretBox` instead of round-tripping through `to_string()
@@ -637,7 +619,6 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
     wallet: &crate::wallet_description::SinglesigJsonWalletDescriptionV0,
     threshold: u8,
     total_shares: u8,
-    is_duress: bool,
     rng: &mut R,
 ) -> Result<Vec<VssJsonWalletDescriptionV0>> {
     use std::sync::Arc;
@@ -646,7 +627,7 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
         Mnemonic::parse(&wallet.seed_phrase).context("Failed to parse mnemonic from wallet")?;
 
     // Recovery authenticates against the no-passphrase xpub; refuse shares
-    // whose metadata would be unrecoverable or leak duress identity.
+    // whose metadata would be unrecoverable.
     {
         let secp_check = crate::random_generation_utils::get_secp(rng);
         let network = bitcoin::Network::from_str(&wallet.network)
@@ -671,16 +652,14 @@ pub fn split_singlesig_wallet<R: rand::RngCore + rand::CryptoRng>(
             "Refusing to split: wallet metadata's xpub does not match the no-passphrase \
              derivation of its seed phrase. VSS share metadata is authenticated against the \
              no-passphrase wallet at recovery time; passing a passphrase-derived wallet here \
-             would either render the share set unrecoverable (xpub mismatch on combine) or, \
-             when `is_duress` is set, leak the hidden wallet's xpub into every share file. \
-             Pass the no-passphrase / decoy wallet instead — for duress-mode backups, that is \
-             the wallet you opened *without* supplying the BIP-39 passphrase."
+             would render the share set unrecoverable (xpub mismatch on combine). Pass the \
+             no-passphrase wallet instead."
         );
     }
 
     let mut shares = split_mnemonic(&mnemonic, threshold, total_shares, rng)?;
     // The VSS wrapper carries public metadata only; seed phrase and xprivs stay out.
-    let metadata = SinglesigPublicMetadataV0::from_singlesig_json(wallet, is_duress);
+    let metadata = SinglesigPublicMetadataV0::from_singlesig_json(wallet);
     for share in &mut shares {
         share.original_wallet = metadata.clone();
     }
@@ -842,15 +821,9 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
             return SinglesigPublicMetadataV0::default();
         }
         let tally_source: &[&VssJsonWalletDescriptionV0] = &deduped;
-        // Exclude `is_duress` from the identity vote; aggregate it separately.
-        let canonicalize_duress = |m: &SinglesigPublicMetadataV0| -> SinglesigPublicMetadataV0 {
-            let mut m_copy = m.clone();
-            m_copy.is_duress = false;
-            m_copy
-        };
         let mut counts: Vec<(usize, SinglesigPublicMetadataV0)> = Vec::new();
         for w in tally_source {
-            let key = canonicalize_duress(&w.original_wallet);
+            let key = w.original_wallet.clone();
             if let Some(entry) = counts.iter_mut().find(|e| e.1 == key) {
                 entry.0 += 1;
             } else {
@@ -860,15 +833,8 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
         // Identity metadata requires a strict majority; ties abstain.
         let top_count = counts.iter().map(|(c, _)| *c).max().unwrap_or(0);
         let top_groups = counts.iter().filter(|(c, _)| *c == top_count).count();
-        // `is_duress` also uses strict majority so one tampered share cannot
-        // authorize a passphrase restore.
-        let duress_yes = tally_source
-            .iter()
-            .filter(|w| w.original_wallet.is_duress)
-            .count();
-        let any_duress = duress_yes * 2 > total_vote_ids;
         let strict_majority = top_groups == 1 && top_count * 2 > total_vote_ids;
-        let mut metadata = if strict_majority {
+        if strict_majority {
             let majority = &counts
                 .iter()
                 .max_by_key(|(c, _)| *c)
@@ -883,9 +849,7 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                  attacker-controlled xpub/network/script_type"
             );
             SinglesigPublicMetadataV0::default()
-        };
-        metadata.is_duress = any_duress;
-        metadata
+        }
     };
 
     let to_recovery = |successes: &mut Vec<SuccessEntry>| -> VssRecovery {
@@ -937,8 +901,8 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                 .skip(1)
                 .all(|(s, _)| s.expose_secret() == first_mnemonic);
             if all_identical {
-                // Empty metadata abstains; non-empty identities and duress
-                // flags must agree across candidates.
+                // Empty metadata abstains; non-empty identities must agree
+                // across candidates.
                 let derived: Vec<SinglesigPublicMetadataV0> = successes
                     .iter()
                     .map(|(_, group)| derive_metadata(group))
@@ -955,12 +919,7 @@ pub fn combine_vss_wallets(vss_wallets: &[VssJsonWalletDescriptionV0]) -> Result
                         non_empty.iter().all(|m| **m == *first)
                     }
                 };
-                let duress_agrees = derived
-                    .iter()
-                    .skip(1)
-                    .all(|m| m.is_duress == derived[0].is_duress);
-                let safe_to_collapse = identity_agrees && duress_agrees;
-                if safe_to_collapse {
+                if identity_agrees {
                     // Prefer the candidate with non-empty metadata.
                     let prefer_idx = derived.iter().position(|m| !is_empty(m));
                     if let Some(idx) = prefer_idx {
@@ -1000,7 +959,6 @@ fn describe_share_group(
     } else {
         derived.singlesig_xpub.as_str()
     };
-    let duress_label = if derived.is_duress { "yes" } else { "no" };
     let mut indexes: Vec<u8> = group.iter().map(|w| w.share_index).collect();
     indexes.sort_unstable();
     indexes.dedup();
@@ -1012,7 +970,7 @@ fn describe_share_group(
     let threshold = group.first().map(|w| w.threshold).unwrap_or(0);
     let total = group.first().map(|w| w.total_shares).unwrap_or(0);
     format!(
-        "  • xpub={xpub_hint} threshold={threshold}/{total} share_indexes={indexes:?} duress={duress_label} newest={newest}"
+        "  • xpub={xpub_hint} threshold={threshold}/{total} share_indexes={indexes:?} newest={newest}"
     )
 }
 
@@ -1024,7 +982,6 @@ mod tests {
         phrase: &str,
         threshold: u8,
         total_shares: u8,
-        is_duress: bool,
     ) -> Vec<VssJsonWalletDescriptionV0> {
         use crate::random_generation_utils::get_secp;
         use crate::wallet_description::{
@@ -1046,14 +1003,7 @@ mod tests {
         .unwrap();
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-        split_singlesig_wallet(
-            json.expose_secret(),
-            threshold,
-            total_shares,
-            is_duress,
-            &mut rng,
-        )
-        .unwrap()
+        split_singlesig_wallet(json.expose_secret(), threshold, total_shares, &mut rng).unwrap()
     }
 
     #[test]
@@ -1214,8 +1164,7 @@ mod tests {
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
-        let vss_wallets =
-            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
+        let vss_wallets = split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng).unwrap();
         assert_eq!(vss_wallets.len(), 3);
 
         // The serialized share must not contain the seed phrase or any xpriv —
@@ -1248,8 +1197,7 @@ mod tests {
     /// whose embedded xpub was derived from a non-default BIP-39
     /// passphrase. The recovery path authenticates against the
     /// no-passphrase derivation; a passphrase-derived xpub baked into
-    /// shares would either render them unrecoverable (xpub mismatch)
-    /// or, for `is_duress=true`, leak the hidden wallet's identity.
+    /// shares would render them unrecoverable (xpub mismatch).
     /// The CLI happens to always pass the no-passphrase decoy, but a
     /// library caller could pass a passphrase-derived wallet and
     /// silently get unsafe shares — the core API enforces the
@@ -1286,7 +1234,7 @@ mod tests {
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&passphrase_wallet, &secp)
                 .unwrap();
 
-        let err = match split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng) {
+        let err = match split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng) {
             Ok(_) => {
                 panic!("expected split_singlesig_wallet to refuse a passphrase-derived wallet")
             }
@@ -1296,19 +1244,6 @@ mod tests {
         assert!(
             msg.contains("Refusing to split") && msg.contains("no-passphrase"),
             "expected refusal pointing at the no-passphrase invariant, got: {msg}"
-        );
-
-        // And the same refusal must fire when is_duress=true (this is
-        // the case where silently accepting would leak the hidden
-        // wallet's xpub via every share file).
-        let err = match split_singlesig_wallet(json.expose_secret(), 2, 3, true, &mut rng) {
-            Ok(_) => panic!("expected refusal in duress mode too"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Refusing to split"),
-            "expected refusal in duress mode, got: {msg}"
         );
     }
 
@@ -1351,7 +1286,7 @@ mod tests {
         .unwrap();
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-        let vss = split_singlesig_wallet(json.expose_secret(), 3, 5, false, &mut rng).unwrap();
+        let vss = split_singlesig_wallet(json.expose_secret(), 3, 5, &mut rng).unwrap();
 
         let salt = get_random_salt(&mut rng).unwrap();
         let nonce = get_random_nonce(&mut rng).unwrap();
@@ -1413,7 +1348,7 @@ mod tests {
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
         // 2-of-2 split: every share counts in the metadata vote.
-        let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 2, false, &mut rng).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 2, &mut rng).unwrap();
         // Tamper with one of the two shares' xpub. Now the vote is
         // 1 (real) vs 1 (forgery) — no strict majority.
         vss[0].original_wallet.singlesig_xpub = "zpub6tampered00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000".to_string();
@@ -1458,7 +1393,7 @@ mod tests {
         .unwrap();
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-        let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 5, false, &mut rng).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 5, &mut rng).unwrap();
         let real_xpub = vss[0].original_wallet.singlesig_xpub.clone();
 
         // Tamper with one share's xpub. Real metadata is in 4 of 5 shares
@@ -1473,98 +1408,12 @@ mod tests {
         );
     }
 
-    /// A single share whose `is_duress` field was edited (false→true
-    /// `is_duress` aggregation uses **strict majority** over the
-    /// deduped, verified shares. A single tampered share can therefore
-    /// neither *fabricate* duress on a normal split (which would
-    /// authorize a passphrase restore via `rebuild_singlesig` and
-    /// silently return an unrelated wallet) nor *suppress* duress on a
-    /// real duress split when the majority of shares still assert it.
-    #[test]
-    fn test_combine_strict_majority_is_duress_aggregation() {
-        use crate::random_generation_utils::get_secp;
-        use crate::wallet_description::{
-            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
-        };
-        use std::str::FromStr;
-        use std::sync::Arc;
-
-        let mut rng = rand::thread_rng();
-        let secp = get_secp(&mut rng);
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
-        let wallet = SingleSigWalletDescriptionV0::generate(
-            Arc::new(mnemonic),
-            &None,
-            bitcoin::Network::Bitcoin,
-            ScriptType::SegwitNative,
-            &secp,
-        )
-        .unwrap();
-        let json =
-            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-
-        // Real duress split with one share's is_duress flipped to
-        // false: 2 of 3 still assert duress (strict majority) ⇒ the
-        // recovery is still flagged as duress.
-        let mut duress_vss =
-            split_singlesig_wallet(json.expose_secret(), 2, 3, true, &mut rng).unwrap();
-        duress_vss[0].original_wallet.is_duress = false;
-        let recovered = combine_vss_wallets(&duress_vss).unwrap();
-        assert!(
-            recovered.metadata.is_duress,
-            "single suppress attempt against a 3-share duress split must lose to majority"
-        );
-
-        // Normal split with one share's is_duress fabricated to true:
-        // only 1 of 3 asserts duress (no strict majority) ⇒ the
-        // recovery is NOT flagged as duress, and rebuild_singlesig
-        // therefore refuses a passphrase — the attacker cannot use
-        // this single-share tamper to authorize a passphrase restore.
-        let mut normal_vss =
-            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
-        normal_vss[0].original_wallet.is_duress = true;
-        let recovered = combine_vss_wallets(&normal_vss).unwrap();
-        assert!(
-            !recovered.metadata.is_duress,
-            "single fabricate attempt against a 3-share normal split must lose to majority"
-        );
-    }
-
-    #[test]
-    fn test_duplicate_metadata_conflicts_count_against_duress_majority() {
-        let vss = split_test_singlesig(
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-            2,
-            3,
-            false,
-        );
-        let mut fabricated_duress = vss[0].clone();
-        fabricated_duress.original_wallet.is_duress = true;
-        let mut conflicting_duplicate = vss[1].clone();
-        conflicting_duplicate.original_wallet.sigtype = "tampered".to_string();
-        let mixed = vec![fabricated_duress, vss[1].clone(), conflicting_duplicate];
-
-        let err = match combine_vss_wallets(&mixed) {
-            Ok(_) => panic!(
-                "conflicting duplicate metadata must not shrink the denominator enough to fabricate duress"
-            ),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("could not be authenticated"),
-            "expected fail-closed authentication error, got: {msg}"
-        );
-    }
-
     #[test]
     fn test_spliced_lo_hi_share_does_not_vote_on_metadata() {
         let mut vss = split_test_singlesig(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
             2,
             3,
-            false,
         );
         let mut splice = vss[0].clone();
         splice.share_data_hi = vss[1].share_data_hi.clone();
@@ -1583,163 +1432,6 @@ mod tests {
         assert!(
             msg.contains("could not be authenticated"),
             "expected fail-closed authentication error, got: {msg}"
-        );
-    }
-
-    /// When a directory contains both a normal split AND a duress
-    /// split of the same wallet, the two recovered mnemonics are
-    /// identical, but their authenticated metadata DIFFERS (`is_duress`
-    /// flag is different — and that flag drives a critical user-
-    /// facing warning). Treating that as silently equivalent and
-    /// returning one group's metadata would either suppress or
-    /// fabricate the duress warning depending on input order, so the
-    /// safer choice is to surface ambiguity. The user can disambiguate
-    /// by passing a specific share-file list.
-    #[test]
-    fn test_combine_treats_normal_vs_duress_same_seed_as_ambiguous() {
-        use crate::random_generation_utils::get_secp;
-        use crate::wallet_description::{
-            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
-        };
-        use std::str::FromStr;
-        use std::sync::Arc;
-
-        let mut rng = rand::thread_rng();
-        let secp = get_secp(&mut rng);
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let mut split = |is_duress: bool| {
-            let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
-            let wallet = SingleSigWalletDescriptionV0::generate(
-                Arc::new(mnemonic),
-                &None,
-                bitcoin::Network::Bitcoin,
-                ScriptType::SegwitNative,
-                &secp,
-            )
-            .unwrap();
-            let json =
-                SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-            split_singlesig_wallet(json.expose_secret(), 2, 3, is_duress, &mut rng).unwrap()
-        };
-
-        let normal = split(false);
-        let duress = split(true);
-        let mixed: Vec<_> = normal
-            .iter()
-            .cloned()
-            .chain(duress.iter().cloned())
-            .collect();
-
-        // Sanity-check: the two share sets do carry different is_duress flags.
-        let normal_duress = normal[0].original_wallet.is_duress;
-        let duress_duress = duress[0].original_wallet.is_duress;
-        assert!(!normal_duress);
-        assert!(duress_duress);
-
-        // Ambiguity error: the duress signal differs even though the
-        // seed is the same.
-        let err = match combine_vss_wallets(&mixed) {
-            Ok(_) => panic!("expected ambiguity error on mixed normal+duress same-seed input"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Ambiguous input"),
-            "expected ambiguity error, got: {msg}"
-        );
-    }
-
-    /// `VssRecovery::rebuild_singlesig` must refuse a passphrase on a NORMAL share set —
-    /// otherwise a typo'd or accidentally-supplied passphrase would
-    /// silently reconstruct an unrelated wallet (there is no on-disk
-    /// witness for a passphrase-derived wallet on a normal share).
-    #[test]
-    fn test_rebuild_singlesig_refuses_passphrase_on_normal_share() {
-        use crate::random_generation_utils::get_secp;
-        use crate::wallet_description::{
-            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
-        };
-        use std::str::FromStr;
-        use std::sync::Arc;
-
-        let mut rng = rand::thread_rng();
-        let secp = get_secp(&mut rng);
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
-        let wallet = SingleSigWalletDescriptionV0::generate(
-            Arc::new(mnemonic),
-            &None,
-            bitcoin::Network::Bitcoin,
-            ScriptType::SegwitNative,
-            &secp,
-        )
-        .unwrap();
-        let json =
-            SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-        // is_duress=false: this is a normal share.
-        let vss = split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
-        let recovered = combine_vss_wallets(&vss[0..2]).unwrap();
-
-        // Without a passphrase: succeeds.
-        recovered.rebuild_singlesig(&None, &secp).unwrap();
-
-        // With a passphrase: must be refused.
-        let typo = Arc::new(secrecy::SecretString::from("oops typo".to_string()));
-        let err = match recovered.rebuild_singlesig(&Some(typo), &secp) {
-            Ok(_) => panic!("expected rebuild_singlesig to refuse a passphrase on a normal share"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("not split in duress mode") || msg.contains("passphrase"),
-            "expected duress-mode refusal, got: {msg}"
-        );
-    }
-
-    /// External callers should restore the real wallet from a duress
-    /// share set via `VssRecovery::rebuild_singlesig`, which makes the
-    /// duress decision from group-aggregated metadata. This test
-    /// covers that path: the share files were created in duress mode,
-    /// recovery yields the seed, and rebuild_singlesig with the
-    /// non-duress passphrase returns the real wallet (different from
-    /// the decoy).
-    #[test]
-    fn test_vss_recovery_supports_duress_restore_with_passphrase() {
-        use crate::random_generation_utils::get_secp;
-        use crate::wallet_description::{
-            ScriptType, SingleSigWalletDescriptionV0, SinglesigJsonWalletDescriptionV0,
-        };
-        use std::str::FromStr;
-        use std::sync::Arc;
-
-        let mut rng = rand::thread_rng();
-        let secp = get_secp(&mut rng);
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let mnemonic = SecretBox::new(Box::new(bip39::Mnemonic::from_str(phrase).unwrap()));
-        let decoy = SingleSigWalletDescriptionV0::generate(
-            Arc::new(mnemonic),
-            &None,
-            bitcoin::Network::Bitcoin,
-            ScriptType::SegwitNative,
-            &secp,
-        )
-        .unwrap();
-        let decoy_json =
-            SinglesigJsonWalletDescriptionV0::from_wallet_description(&decoy, &secp).unwrap();
-        // is_duress=true on the split.
-        let vss = split_singlesig_wallet(decoy_json.expose_secret(), 2, 3, true, &mut rng).unwrap();
-        let recovered = combine_vss_wallets(&vss[0..2]).unwrap();
-        assert_eq!(recovered.mnemonic.expose_secret().to_string(), phrase);
-        assert!(recovered.metadata.is_duress);
-
-        // Real-wallet restore via the safe API.
-        let passphrase = Arc::new(secrecy::SecretString::from("non-duress secret".to_string()));
-        let real = recovered
-            .rebuild_singlesig(&Some(Arc::clone(&passphrase)), &secp)
-            .unwrap();
-        assert_ne!(
-            real.encoded_singlesig_xpub(),
-            decoy.encoded_singlesig_xpub()
         );
     }
 
@@ -1771,8 +1463,7 @@ mod tests {
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
-        let mut vss_wallets =
-            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
+        let mut vss_wallets = split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng).unwrap();
 
         // Construct an unrelated wallet to source a valid-looking but wrong xpub.
         let other_phrase =
@@ -1837,7 +1528,7 @@ mod tests {
             .unwrap();
             let json =
                 SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap()
+            split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng).unwrap()
         };
 
         let set_old = split_same();
@@ -1890,7 +1581,7 @@ mod tests {
             .unwrap();
             let json =
                 SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap()
+            split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng).unwrap()
         };
 
         let set_a = make_wallets(phrase_a);
@@ -1971,7 +1662,7 @@ mod tests {
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
         // 3-of-3: each share is mandatory.
-        let mut vss = split_singlesig_wallet(json.expose_secret(), 3, 3, false, &mut rng).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 3, 3, &mut rng).unwrap();
         // Corrupt the LO verifier on share[2] only — its share_data /
         // blinder_share_data stay intact.
         vss[2].verification_data = "deadbeef,deadbeef,deadbeef,deadbeef,deadbeef".to_string();
@@ -2023,7 +1714,7 @@ mod tests {
         //   (good_lo_1, bad_hi)      ← from share[1]
         // both of which fail the Pedersen check. The cross-product
         // adds (good_lo_1, good_hi_0), which combines successfully.
-        let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 2, false, &mut rng).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 2, &mut rng).unwrap();
         vss[0].verification_data = "deadbeef,deadbeef,deadbeef,deadbeef".to_string();
         vss[1].verification_data_hi = Some("cafebabe,cafebabe,cafebabe,cafebabe".to_string());
 
@@ -2066,7 +1757,7 @@ mod tests {
         .unwrap();
         let json =
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-        let mut vss = split_singlesig_wallet(json.expose_secret(), 3, 5, false, &mut rng).unwrap();
+        let mut vss = split_singlesig_wallet(json.expose_secret(), 3, 5, &mut rng).unwrap();
 
         // Low half can still recover from ids {1,2,3}; high half can
         // still recover from ids {3,4,5}. Their complete intersection is
@@ -2159,7 +1850,7 @@ mod tests {
             .unwrap();
             let json =
                 SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
-            split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap()
+            split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng).unwrap()
         };
 
         let mut set_a = split(phrase_a); // larger group, but two shares get corrupted
@@ -2227,8 +1918,7 @@ mod tests {
             SinglesigJsonWalletDescriptionV0::from_wallet_description(&wallet, &secp).unwrap();
 
         for tampered_threshold in [1u8, 5u8, 99u8] {
-            let mut vss =
-                split_singlesig_wallet(json.expose_secret(), 2, 3, false, &mut rng).unwrap();
+            let mut vss = split_singlesig_wallet(json.expose_secret(), 2, 3, &mut rng).unwrap();
             for w in vss.iter_mut() {
                 w.threshold = tampered_threshold;
                 w.total_shares = 99; // also corrupt this — should be ignored
