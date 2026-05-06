@@ -22,10 +22,6 @@ use frozenkrill_core::{
 use crate::progress_bar::get_spinner;
 
 /// Split a wallet's seed phrase into shares using Pedersen secret sharing.
-///
-/// `is_duress` records, in the share metadata, whether the user supplied a
-/// non-duress BIP-39 passphrase at split time. Recovery later uses the
-/// group-authenticated flag to decide whether a passphrase is accepted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn split_singlesig_wallet(
     secp: &Secp256k1<All>,
@@ -38,7 +34,6 @@ pub(crate) fn split_singlesig_wallet(
     difficulty: KeyDerivationDifficulty,
     padding_params: &PaddingParams,
     encrypted_version: EncryptedWalletVersion,
-    is_duress: bool,
     rng: &mut (impl frozenkrill_core::rand::RngCore + frozenkrill_core::rand::CryptoRng),
 ) -> anyhow::Result<()> {
     // VSS share decryption only handles V0Standard; reject anything else
@@ -50,7 +45,7 @@ pub(crate) fn split_singlesig_wallet(
 
     // The "do you understand the risks?" confirmation prompt now runs
     // in `main.rs::Commands::SplitSecret` BEFORE we ask the user for
-    // any password / passphrase, so cancelling at the warning doesn't
+    // any password, so cancelling at the warning doesn't
     // waste a credential prompt. By the time we get here the user has
     // already acknowledged the M-of-N reconstruction trade-off and the
     // irreversibility note. We deliberately don't repeat the prompt
@@ -65,14 +60,9 @@ pub(crate) fn split_singlesig_wallet(
     let spinner = get_spinner("Splitting seed into shares using Pedersen scheme...");
 
     // Perform the split using the core function
-    let vss_wallets = split_singlesig_wallet_core(
-        wallet_json.expose_secret(),
-        threshold,
-        total_shares,
-        is_duress,
-        rng,
-    )
-    .context("Failed to split wallet into shares")?;
+    let vss_wallets =
+        split_singlesig_wallet_core(wallet_json.expose_secret(), threshold, total_shares, rng)
+            .context("Failed to split wallet into shares")?;
 
     spinner.finish_with_message("✓ Seed successfully split into shares");
 

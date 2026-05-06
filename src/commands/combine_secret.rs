@@ -156,27 +156,6 @@ pub(crate) fn combine_shares(
     // user can redirect or clear their terminal as needed.
     let _ = display_mnemonic; // kept for backwards-compat with the CLI flag
 
-    // If the recovered share set was created in duress mode, the
-    // mnemonic alone reconstructs only the *decoy* wallet. Surface that
-    // loudly so a user recovering months later doesn't think the job
-    // is done — restoring the real wallet still requires the BIP-39
-    // passphrase they remember separately.
-    if reconstructed.metadata.is_duress {
-        println!("\n⚠️  DURESS-MODE BACKUP DETECTED");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("These shares were created with `--enable-duress-wallet`.");
-        println!("The mnemonic below reconstructs the SEED, which is the");
-        println!("same for the decoy and the real wallet — but the embedded");
-        println!("share metadata describes the DECOY wallet only.");
-        println!();
-        println!("To restore the REAL (hidden) wallet you must:");
-        println!("  1. Take the recovered mnemonic shown below.");
-        println!("  2. Apply your non-duress BIP-39 passphrase to it");
-        println!("     (the secret you remember from split time).");
-        println!("Without that passphrase, the seed alone yields the decoy.");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    }
-
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("⚠️  RECONSTRUCTED MNEMONIC (KEEP THIS SECRET!)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
